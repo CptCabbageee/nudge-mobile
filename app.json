@@ -1,0 +1,51 @@
+{
+  "expo": {
+    "name": "nudge-mobile",
+    "slug": "nudge-mobile",
+    "scheme": "nudge",
+    "newArchEnabled": false,
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/logo.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/images/logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow Nudge to use your location to show your position on the map."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Nudge to choose a profile photo from your library.",
+          "cameraPermission": "Allow Nudge to take a profile photo."
+        }
+      ],
+      "expo-font",
+      "expo-sqlite",
+      "@react-native-community/datetimepicker"
+    ]
+  }
+}
