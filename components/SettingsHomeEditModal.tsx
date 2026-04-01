@@ -18,7 +18,6 @@ import type { UserHomeRow } from '../lib/home-queries'
 import type { SearchResult } from '../types'
 import type { HomeDraft } from './HomeLocationGateModal'
 import { AppLogo } from './AppLogo'
-import { AppTiledBackground } from './AppTiledBackground'
 import { GooglePlacesAddressSearchField } from './GooglePlacesAddressSearchField'
 
 const BG = '#141414'
@@ -50,20 +49,17 @@ export function SettingsHomeEditModal({
   const insets = useSafeAreaInsets()
   const [draft, setDraft] = useState<HomeDraft | null>(null)
   const [mapPick, setMapPick] = useState(false)
-  const [searchQuery, setSearchQuery] = useState('')
   const mapRef = useRef<MapView | null>(null)
 
   useEffect(() => {
     if (!visible || !homeRow) return
     setDraft({ lat: homeRow.lat, lng: homeRow.lng, name: homeRow.name })
     setMapPick(false)
-    setSearchQuery('')
   }, [visible, homeRow?.id, homeRow?.lat, homeRow?.lng, homeRow?.name])
 
   const onSelectSearch = useCallback((r: SearchResult) => {
     const name = (r.display_name || r.name).trim() || 'Home'
     setDraft({ lat: r.lat, lng: r.lng, name })
-    setSearchQuery('')
     const region: Region = {
       latitude: r.lat,
       longitude: r.lng,
@@ -126,7 +122,7 @@ export function SettingsHomeEditModal({
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onDismiss}>
-      <AppTiledBackground>
+      <View style={{ flex: 1, backgroundColor: 'transparent' }}>
         <KeyboardAvoidingView
           style={styles.flex}
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -158,8 +154,6 @@ export function SettingsHomeEditModal({
           <Text style={styles.label}>Search</Text>
           <GooglePlacesAddressSearchField
             variant="form"
-            value={searchQuery}
-            onChangeText={setSearchQuery}
             enabled={visible}
             placeholder="Street, postcode, place…"
             accentColor={ACCENT}
@@ -229,7 +223,7 @@ export function SettingsHomeEditModal({
           </ScrollView>
           </View>
         </KeyboardAvoidingView>
-      </AppTiledBackground>
+      </View>
     </Modal>
   )
 }

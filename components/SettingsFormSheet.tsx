@@ -11,7 +11,6 @@ import {
 } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { AppLogo } from './AppLogo'
-import { AppTiledBackground } from './AppTiledBackground'
 
 const BG = '#141414'
 const ACCENT = '#00BFA5'
@@ -29,7 +28,7 @@ export function SettingsFormSheet({ visible, title, onClose, children }: Props) 
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
-      <AppTiledBackground>
+      <View style={{ flex: 1, backgroundColor: 'transparent' }}>
         <KeyboardAvoidingView
           style={styles.flex}
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -57,7 +56,7 @@ export function SettingsFormSheet({ visible, title, onClose, children }: Props) 
             {children}
           </View>
         </KeyboardAvoidingView>
-      </AppTiledBackground>
+      </View>
     </Modal>
   )
 }

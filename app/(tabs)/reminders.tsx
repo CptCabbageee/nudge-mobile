@@ -7,6 +7,7 @@ import { AppTiledBackground } from '../../components/AppTiledBackground'
 import NudgeList from '../../components/NudgeList'
 import NudgeModal, { type NudgeSavePayload } from '../../components/NudgeModal'
 import { useAuth } from '../../context/AuthContext'
+import { effectiveUserId } from '../../lib/dev-user'
 import { deleteNudgeForUser, fetchUserNudges, updateNudgeForUser } from '../../lib/nudge-queries'
 import { loadDefaultRadiusMeters } from '../../lib/user-preferences'
 
@@ -20,11 +21,11 @@ export default function RemindersScreen() {
   const [modalOpen, setModalOpen] = useState(false)
 
   const refresh = useCallback(async () => {
-    if (!user?.id) return
-    const [n, defaultRadius] = await Promise.all([fetchUserNudges(user.id), loadDefaultRadiusMeters()])
+    const uid = effectiveUserId(user?.id)
+    const [n, defaultRadius] = await Promise.all([fetchUserNudges(uid), loadDefaultRadiusMeters()])
     if (!n.error) setNudges(n.data)
     setRadiusMeters(defaultRadius)
-  }, [user?.id])
+  }, [])
 
   useFocusEffect(
     useCallback(() => {
@@ -34,14 +35,14 @@ export default function RemindersScreen() {
 
   const onDelete = useCallback(
     (id: string) => {
-      if (!user?.id) return
+      const uid = effectiveUserId(user?.id)
       Alert.alert('Delete nudge?', 'This cannot be undone.', [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Delete',
           style: 'destructive',
           onPress: async () => {
-            const res = await deleteNudgeForUser(user.id, id)
+            const res = await deleteNudgeForUser(uid, id)
             if (!res.error) await refresh()
           },
         },
@@ -52,15 +53,16 @@ export default function RemindersScreen() {
 
   const onSave = useCallback(
     async (payload: NudgeSavePayload) => {
-      if (!user?.id || !payload.nudgeId || !payload.locationId) return
-      const res = await updateNudgeForUser(user.id, payload.nudgeId, payload.locationId, payload)
+      if (!payload.nudgeId || !payload.locationId) return
+      const uid = effectiveUserId(user?.id)
+      const res = await updateNudgeForUser(uid, payload.nudgeId, payload.locationId, payload)
       if (!res.error) {
         setModalOpen(false)
-        setEditNudge(null)
         await refresh()
+        setTimeout(() => setEditNudge(null), 300)
       }
     },
-    [refresh, user?.id],
+    [refresh],
   )
 
   const listData = useMemo(() => nudges, [nudges])

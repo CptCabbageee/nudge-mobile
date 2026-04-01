@@ -1,37 +1,22 @@
 import { Ionicons } from '@expo/vector-icons'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import Constants from 'expo-constants'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Pressable, StyleSheet, View, type StyleProp, type TextStyle, type ViewStyle } from 'react-native'
 import {
-  ActivityIndicator,
-  Pressable,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
-  type StyleProp,
-  type TextStyle,
-  type ViewStyle,
-} from 'react-native'
-import { fetchGooglePlaceAutocompleteSuggestions, fetchGooglePlaceDetails } from '../lib/google-places'
+  GooglePlacesAutocomplete,
+  type GooglePlacesAutocompleteRef,
+} from 'react-native-google-places-autocomplete'
 import type { SearchResult } from '../types'
 
 const ACCENT = '#00BFA5'
 const MUTED = 'rgba(255,255,255,0.55)'
 const SURFACE = '#141414'
 
-const MAP_OVERLAY_TEXT_SHADOW = {
-  textShadowColor: 'rgba(0,0,0,0.8)',
-  textShadowOffset: { width: 1, height: 1 } as const,
-  textShadowRadius: 3,
-}
-
-const DEBOUNCE_MS = 400
-const MIN_CHARS = 2
-
 type Variant = 'mapBar' | 'form'
 
 type Props = {
-  value: string
-  onChangeText: (t: string) => void
+  value?: string
+  onChangeText?: (t: string) => void
   onSelect: (r: SearchResult) => void
   placeholder?: string
   enabled?: boolean
@@ -42,218 +27,227 @@ type Props = {
   formInputStyle?: StyleProp<TextStyle>
   mapLat: number
   mapLng: number
-  /** Map bar only: show clear (X) when there is text. */
   showMapClearButton?: boolean
+  onSearchTextChange?: (t: string) => void
 }
 
-type GoogleSuggestion = {
-  placeId: string
-  description: string
-}
-
-/** Google Places Autocomplete + Details only (no Nominatim). Suggestions render as plain Views, not FlatList. */
 export function GooglePlacesAddressSearchField({
-  value,
+  value = '',
   onChangeText,
   onSelect,
   placeholder = 'Search places',
   enabled = true,
   variant,
-  accentColor = ACCENT,
+  accentColor: _accentColor = ACCENT,
   surfaceColor = SURFACE,
   mapBarStyle,
   formInputStyle,
   mapLat,
   mapLng,
   showMapClearButton = true,
+  onSearchTextChange,
 }: Props) {
-  const [results, setResults] = useState<GoogleSuggestion[]>([])
-  const [loading, setLoading] = useState(false)
-  const abortRef = useRef<AbortController | null>(null)
-  const mapCenterRef = useRef({ lat: mapLat, lng: mapLng })
-  mapCenterRef.current = { lat: mapLat, lng: mapLng }
+  const ref = useRef<GooglePlacesAutocompleteRef>(null)
+  const isMapBar = variant === 'mapBar'
+  const [hasInputText, setHasInputText] = useState(false)
 
-  useEffect(() => {
-    if (!enabled) {
-      abortRef.current?.abort()
-      setResults([])
-      setLoading(false)
-      return
-    }
+  const apiKey = (Constants.expoConfig?.extra?.googlePlacesApiKey as string) ?? ''
 
-    const q = value.trim()
-    if (q.length < MIN_CHARS) {
-      abortRef.current?.abort()
-      setResults([])
-      setLoading(false)
-      return
-    }
-
-    const ac = new AbortController()
-    abortRef.current?.abort()
-    abortRef.current = ac
-    setLoading(true)
-
-    const timer = setTimeout(() => {
-      const { lat, lng } = mapCenterRef.current
-      void fetchGooglePlaceAutocompleteSuggestions(q, lat, lng, ac.signal)
-        .then((rows) => {
-          if (!ac.signal.aborted) setResults(rows)
-        })
-        .finally(() => {
-          if (!ac.signal.aborted) setLoading(false)
-        })
-    }, DEBOUNCE_MS)
-
-    return () => {
-      clearTimeout(timer)
-      ac.abort()
-    }
-  }, [value, enabled])
-
-  const onPick = useCallback(
-    async (r: GoogleSuggestion) => {
-      setResults([])
-      const ac = new AbortController()
-      try {
-        setLoading(true)
-        const details = await fetchGooglePlaceDetails(r.placeId, ac.signal)
-        if (!details) return
-        onSelect(details)
-      } finally {
-        setLoading(false)
-      }
-    },
-    [onSelect],
+  const query = useMemo(
+    () => ({
+      key: apiKey,
+      language: 'en' as const,
+      components: 'country:gb',
+      location: `${mapLat},${mapLng}`,
+      radius: 50000,
+    }),
+    [mapLat, mapLng, apiKey],
   )
 
-  const showClear =
-    variant === 'mapBar' && showMapClearButton && typeof value === 'string' && value.length > 0
+  useEffect(() => {
+    ref.current?.setAddressText(value ?? '')
+    setHasInputText(Boolean(value?.trim()))
+  }, [value])
 
-  const suggestionRows =
-    results.length > 0 || loading ? (
-      <View style={styles.dropdown} collapsable={false}>
-        {loading ? (
-          <View style={styles.listHeader}>
-            <ActivityIndicator color={accentColor} size="small" />
-          </View>
-        ) : null}
-        {results.length === 0 && !loading ? (
-          <View style={styles.emptyPad}>
-            <Text style={styles.emptyText}>No results</Text>
-          </View>
-        ) : (
-          results.map((item, index) => (
-            <Pressable
-              key={`${item.placeId}:${index}`}
-              style={styles.row}
-              onPress={() => void onPick(item)}
-              android_ripple={{ color: 'rgba(255,255,255,0.12)' }}
-            >
-              <Text style={styles.rowText} numberOfLines={3}>
-                {item.description}
-              </Text>
-            </Pressable>
-          ))
-        )}
-      </View>
-    ) : null
+  const emitText = (t: string) => {
+    setHasInputText(Boolean(t.trim()))
+    onChangeText?.(t)
+    onSearchTextChange?.(t)
+  }
 
-  if (variant === 'mapBar') {
+  const autocomplete = (
+    <GooglePlacesAutocomplete
+      ref={ref}
+      placeholder={placeholder}
+      minLength={2}
+      debounce={300}
+      enablePoweredByContainer={false}
+      fetchDetails
+      keepResultsAfterBlur
+      keyboardShouldPersistTaps="handled"
+      listViewDisplayed="auto"
+      GooglePlacesDetailsQuery={{ fields: 'geometry,formatted_address' }}
+      query={query}
+      disableScroll={false}
+      renderLeftButton={
+        isMapBar
+          ? () => <Ionicons name="search-outline" size={18} color={MUTED} style={styles.searchIcon} />
+          : () => null
+      }
+      textInputProps={{
+        editable: enabled,
+        placeholderTextColor: MUTED,
+        autoCorrect: false,
+        clearButtonMode: 'never',
+        color: '#fff',
+        selectionColor: '#fff',
+        underlineColorAndroid: 'transparent',
+        onChangeText: (t: string) => emitText(t),
+        style: isMapBar ? undefined : formInputStyle,
+      }}
+      onPress={(data, details) => {
+        if (!details?.geometry?.location) return
+        const loc = details.geometry.location
+        const lat = loc.lat ?? loc.latitude
+        const lng = loc.lng ?? loc.longitude
+        if (typeof lat !== 'number' || typeof lng !== 'number') return
+        onSelect({
+          lat,
+          lng,
+          name: data.structured_formatting?.main_text ?? data.description,
+          display_name: details.formatted_address ?? data.description,
+        })
+        ref.current?.setAddressText('')
+        setHasInputText(false)
+        emitText('')
+      }}
+      styles={{
+        container: isMapBar
+          ? { flex: 1, minWidth: 0, zIndex: 200, elevation: 30 }
+          : { alignSelf: 'stretch', width: '100%', zIndex: 200, elevation: 30 },
+        textInputContainer: {
+          backgroundColor: 'transparent',
+          borderTopWidth: 0,
+          borderBottomWidth: 0,
+          paddingHorizontal: 0,
+          alignItems: 'center',
+        },
+        textInput: {
+          backgroundColor: isMapBar ? 'transparent' : surfaceColor,
+          color: '#fff',
+          fontSize: isMapBar ? 15 : 16,
+          height: 40,
+          borderRadius: isMapBar ? 0 : 12,
+          borderWidth: isMapBar ? 0 : 1,
+          borderColor: 'rgba(255,255,255,0.2)',
+          paddingHorizontal: isMapBar ? 4 : 12,
+          marginTop: 0,
+          marginBottom: 0,
+          flex: 1,
+        },
+        listView: {
+          backgroundColor: SURFACE,
+          borderRadius: 12,
+          borderWidth: 1,
+          borderColor: 'rgba(255,255,255,0.2)',
+          marginTop: 4,
+          zIndex: 300,
+          elevation: 30,
+          position: 'absolute',
+          top: 44,
+          left: 0,
+          right: 0,
+          maxHeight: 260,
+        },
+        row: {
+          backgroundColor: SURFACE,
+          paddingVertical: 10,
+          paddingHorizontal: 12,
+        },
+        description: { color: '#fff', fontSize: 13 },
+        separator: {
+          backgroundColor: 'rgba(255,255,255,0.1)',
+          height: StyleSheet.hairlineWidth,
+        },
+        loader: {
+          flexDirection: 'row',
+          justifyContent: 'flex-end',
+          height: 20,
+        },
+        poweredContainer: { height: 0, overflow: 'hidden', opacity: 0 },
+      }}
+    />
+  )
+
+  if (!isMapBar) {
     return (
-      <View style={styles.mapBarWrap}>
-        <View style={[styles.mapBar, { backgroundColor: surfaceColor, borderColor: 'rgba(255,255,255,0.2)' }, mapBarStyle]}>
-          <Ionicons name="search-outline" size={18} color={MUTED} />
-          <TextInput
-            value={value}
-            onChangeText={onChangeText}
-            placeholder={placeholder}
-            placeholderTextColor={MUTED}
-            style={styles.mapInput}
-            autoCorrect={false}
-          />
-          {showClear ? (
-            <Pressable
-              onPress={() => {
-                onChangeText('')
-                setResults([])
-              }}
-              hitSlop={10}
-              style={styles.clearBtn}
-              accessibilityLabel="Clear search"
-            >
-              <Ionicons name="close-circle" size={20} color={MUTED} />
-            </Pressable>
-          ) : null}
-          {loading && results.length === 0 ? <ActivityIndicator color={accentColor} size="small" /> : null}
-        </View>
-        {suggestionRows}
+      <View style={styles.formWrap} collapsable={false} pointerEvents="auto">
+        {autocomplete}
       </View>
     )
   }
 
   return (
-    <View collapsable={false} style={styles.formWrap}>
-      <TextInput
-        value={value}
-        onChangeText={onChangeText}
-        placeholder={placeholder}
-        placeholderTextColor={MUTED}
-        style={[
-          styles.formInput,
-          { backgroundColor: surfaceColor, borderColor: 'rgba(255,255,255,0.2)', color: '#fff' },
-          formInputStyle,
-        ]}
-        autoCorrect={false}
-      />
-      {loading && results.length === 0 ? (
-        <ActivityIndicator color={accentColor} style={{ marginVertical: 8 }} />
+    <View
+      style={[styles.wrap, styles.mapBarWrap, mapBarStyle, styles.mapBarRelative]}
+      collapsable={false}
+      pointerEvents="auto"
+    >
+      <View style={styles.mapBarInputSlot} collapsable={false}>
+        {autocomplete}
+      </View>
+      {showMapClearButton && hasInputText ? (
+        <Pressable
+          onPress={() => {
+            ref.current?.setAddressText('')
+            emitText('')
+          }}
+          hitSlop={10}
+          style={styles.clearBtn}
+          accessibilityLabel="Clear search"
+        >
+          <Ionicons name="close-circle" size={20} color={MUTED} />
+        </Pressable>
       ) : null}
-      {suggestionRows}
     </View>
   )
 }
 
 const styles = StyleSheet.create({
-  mapBarWrap: { zIndex: 200, elevation: 30 },
-  formWrap: { zIndex: 200, elevation: 30 },
-  mapBar: {
-    borderRadius: 12,
-    borderWidth: 1,
-    paddingHorizontal: 10,
-    minHeight: 44,
-    alignItems: 'center',
+  wrap: {
     flexDirection: 'row',
-    gap: 8,
-  },
-  clearBtn: { padding: 2 },
-  mapInput: { flex: 1, color: '#fff', fontSize: 15, paddingVertical: 10, ...MAP_OVERLAY_TEXT_SHADOW },
-  formInput: {
-    borderWidth: 1,
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 16,
-  },
-  dropdown: {
+    alignItems: 'center',
     zIndex: 200,
     elevation: 30,
+  },
+  mapBarRelative: {
+    position: 'relative',
+    zIndex: 200,
+  },
+  mapBarInputSlot: {
+    flex: 1,
+    minWidth: 0,
+  },
+  mapBarWrap: {
     backgroundColor: SURFACE,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.2)',
-    marginTop: 6,
-    maxHeight: 220,
-    overflow: 'hidden',
+    paddingHorizontal: 10,
+    minHeight: 44,
   },
-  listHeader: { paddingVertical: 8, alignItems: 'center' },
-  emptyPad: { padding: 12 },
-  emptyText: { color: MUTED, fontSize: 13 },
-  row: {
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: 'rgba(255,255,255,0.1)',
+  formWrap: {
+    backgroundColor: 'transparent',
+    zIndex: 200,
+    elevation: 30,
+    position: 'relative',
   },
-  rowText: { color: '#fff', fontSize: 13 },
+  searchIcon: {
+    marginRight: 4,
+  },
+  clearBtn: {
+    padding: 2,
+    marginLeft: 4,
+    flexShrink: 0,
+  },
 })

@@ -8,6 +8,7 @@ import {
   ActivityIndicator,
   Alert,
   InteractionManager,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -21,6 +22,7 @@ import { GooglePlacesAddressSearchField } from '../../components/GooglePlacesAdd
 import { AppTiledBackground } from '../../components/AppTiledBackground'
 import { AppStartupSplash } from '../../components/AppStartupSplash'
 import NudgeModal, { type NudgeSavePayload } from '../../components/NudgeModal'
+import { NudgeToast } from '../../components/NudgeToast'
 import { CategoryIcon } from '../../components/CategoryIcon'
 import { useAuth } from '../../context/AuthContext'
 import { useLeavingHomePrompt } from '../../context/LeavingHomePromptContext'
@@ -70,7 +72,7 @@ const POI_FETCH_MIN_MOVE_M = 500
 const MIN_REGION_PUBLISH_MOVE_M = 80
 
 /** Custom nudge pins need bitmap updates to show {@link CategoryIcon} reliably. */
-const MARKER_TRACKS_NUDGE_CHANGES = true
+const MARKER_TRACKS_NUDGE_CHANGES = false
 /** POI/cluster markers use custom child views. */
 const MARKER_TRACKS_POI_CHANGES = true
 /** Default pins / simple markers — avoid unnecessary native view sync. */
@@ -101,9 +103,9 @@ async function getCurrentPositionWithTimeout(timeoutMs: number): Promise<Locatio
 }
 
 const nudgePinMarkerStyle = {
-  width: 28,
-  height: 28,
-  borderRadius: 14,
+  width: 36,
+  height: 36,
+  borderRadius: 18,
   alignItems: 'center' as const,
   justifyContent: 'center' as const,
   backgroundColor: ACCENT,
@@ -146,6 +148,7 @@ const MapNudgeMarker = memo(
       <Marker
         coordinate={{ latitude: nudge.lat, longitude: nudge.lng }}
         tracksViewChanges={MARKER_TRACKS_NUDGE_CHANGES}
+        hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
         onPress={() => onPress(nudge)}
       >
         <View style={nudgePinMarkerStyle} collapsable={false}>
@@ -194,13 +197,11 @@ function MapScreenBody({
   const [tapDraft, setTapDraft] = useState<{ lat: number; lng: number; title?: string; category?: string } | null>(null)
   const [nudgeEditPrompt, setNudgeEditPrompt] = useState<(typeof nudges)[number] | null>(null)
   const [radiusMeters, setRadiusMeters] = useState(25)
-  const [searchQuery, setSearchQuery] = useState('')
   const [searchAnchor, setSearchAnchor] = useState<{ lat: number; lng: number } | null>(null)
   const [homeGateOpen, setHomeGateOpen] = useState(false)
   const [homeGateChecked, setHomeGateChecked] = useState(false)
   const [homeDraft, setHomeDraft] = useState<HomeDraft | null>(null)
   const [homeMapPickActive, setHomeMapPickActive] = useState(false)
-  const [homeSearchQuery, setHomeSearchQuery] = useState('')
   const [homeSaving, setHomeSaving] = useState(false)
   const [pois, setPois] = useState<MapPoi[]>([])
   const [poiProgress, setPoiProgress] = useState(0)
@@ -208,10 +209,14 @@ function MapScreenBody({
   const [poiFetchActive, setPoiFetchActive] = useState(false)
   const [isMapCenteredOnUser, setIsMapCenteredOnUser] = useState(true)
   const [hasHomeLeaveNudge, setHasHomeLeaveNudge] = useState(false)
+  const [toastMessage, setToastMessage] = useState('')
+  const [toastVisible, setToastVisible] = useState(false)
   const mapRef = useRef<MapView | null>(null)
   const poiAbortRef = useRef<AbortController | null>(null)
   const mapInitialRegionRef = useRef<Region | null>(null)
   const homeGateDismissedRef = useRef(false)
+  const homeGateOpenedRef = useRef(false)
+  const hasDoneInitialPoiFetchRef = useRef(false)
   /** Last map centre we used to start a POI fetch (onRegionChangeComplete only). */
   const lastPoiFetchCenterRef = useRef<{ lat: number; lng: number } | null>(null)
   /** Last {@link poiAreaCacheKey} we successfully loaded (cache or network). Used with 500 m guard. */
@@ -223,6 +228,12 @@ function MapScreenBody({
   const regionPublishedRef = useRef<Region | null>(null)
   const poiProgressEmitRef = useRef({ lastTs: 0 })
   const poiFetchCountRef = useRef(0)
+  const nudgeCoordsRef = useRef<{ lat: number; lng: number }[]>([])
+
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg)
+    setToastVisible(true)
+  }, [])
 
   useEffect(() => {
     setUserCoords(initialUserCoords)
@@ -230,6 +241,10 @@ function MapScreenBody({
   useEffect(() => {
     setRegion(initialRegion)
   }, [initialRegion])
+
+  useEffect(() => {
+    nudgeCoordsRef.current = nudges.map((n) => ({ lat: n.lat, lng: n.lng }))
+  }, [nudges])
 
   const applyPoisBatch = useCallback((all: MapPoi[]) => {
     setPois(all)
@@ -272,7 +287,8 @@ function MapScreenBody({
     setRadiusMeters(defaultRadius)
     setMapStyle(style)
     setHomeGateChecked(true)
-  }, [user?.id])
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- effectiveUserId(user?.id) read fresh each call
+  }, [])
 
   useEffect(() => {
     if (!isFocused) return
@@ -283,6 +299,8 @@ function MapScreenBody({
   useEffect(() => {
     if (!homeGateChecked) return
     if (homeGateDismissedRef.current) return
+    if (homeGateOpenedRef.current) return
+    homeGateOpenedRef.current = true
     setHomeGateOpen(!homeRow)
   }, [homeRow, homeGateChecked])
 
@@ -361,7 +379,7 @@ function MapScreenBody({
 
         const perQueryLimit = 50
         const span = Math.max(r.latitudeDelta, r.longitudeDelta)
-        const nudgeCoords = nudges.map((n) => ({ lat: n.lat, lng: n.lng }))
+        const nudgeCoords = nudgeCoordsRef.current
 
         const runNetworkFetch = (silent: boolean) => {
           const ac = new AbortController()
@@ -393,6 +411,11 @@ function MapScreenBody({
                 setPois(filtered)
               } else {
                 applyPoisBatch(filtered)
+                console.log('[Cluster debug]', {
+                  rawBatch: batch.length,
+                  filtered: filtered.length,
+                  clustered: clusterMapPois(filtered).filter((x) => x.kind === 'cluster').length,
+                })
               }
               lastPoiFetchAreaKeyRef.current = areaKey
               void putPoiAreaCache(areaKey, filtered)
@@ -435,7 +458,7 @@ function MapScreenBody({
         await runNetworkFetch(false)
       })()
     },
-    [nudges, onPoiProgress, applyPoisBatch],
+    [onPoiProgress, applyPoisBatch],
   )
 
   /** Refetch POIs when nudges change (near-nudge filtering). Skipped when zoomed out. */
@@ -445,7 +468,19 @@ function MapScreenBody({
     lastPoiFetchCenterRef.current = null
     lastPoiFetchAreaKeyRef.current = null
     maybeFetchPoisForRegion(r, { force: true })
-  }, [nudges, maybeFetchPoisForRegion])
+  // maybeFetchPoisForRegion is stable (no nudges in deps); only re-run when nudges change.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nudges])
+
+  useEffect(() => {
+    if (!isFocused) return
+    if (hasDoneInitialPoiFetchRef.current) return
+    const r = stableMapRegionRef.current ?? initialRegion
+    if (!isValidMapRegionForFetch(r) || !regionShowsPoiMarkers(r)) return
+    hasDoneInitialPoiFetchRef.current = true
+    maybeFetchPoisForRegion(r)
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- initial POI once per focus; stable maybeFetchPoisForRegion
+  }, [isFocused, maybeFetchPoisForRegion])
 
   /**
    * Pre-fetch POIs for the home location tile (`lib/poi-fetch`, OSM/Nominatim for POI pins only).
@@ -455,9 +490,7 @@ function MapScreenBody({
     if (!homeRow) return
 
     const areaKey = poiAreaCacheKey(homeRow.lat, homeRow.lng)
-    const nudgeCoords = nudges
-      .filter((n) => Number.isFinite(n.lat) && Number.isFinite(n.lng))
-      .map((n) => ({ lat: n.lat, lng: n.lng }))
+    const nudgeCoords = nudgeCoordsRef.current
 
     let cancelled = false
     void (async () => {
@@ -496,7 +529,7 @@ function MapScreenBody({
       homePoiPrefetchAbortRef.current?.abort()
       homePoiPrefetchAbortRef.current = null
     }
-  }, [homeRow?.id, homeRow?.lat, homeRow?.lng, nudges])
+  }, [homeRow?.id, homeRow?.lat, homeRow?.lng])
 
   const nudgesOnMap = useMemo(
     () =>
@@ -626,6 +659,7 @@ function MapScreenBody({
           setEditNudge(null)
           setPendingCreate(null)
           setTapDraft(null)
+          showToast('Nudge saved!')
         }
         return
       }
@@ -645,6 +679,7 @@ function MapScreenBody({
           .single()
         if (loc.error || !loc.data?.id) {
           console.warn('[saveNudge] locations insert failed', loc.error)
+          Alert.alert('Save failed', loc.error?.message ?? 'Location insert returned no data')
           return
         }
         locationId = loc.data.id
@@ -661,15 +696,17 @@ function MapScreenBody({
       })
       if (ins.error) {
         console.warn('[saveNudge] nudges insert failed', ins.error)
+        Alert.alert('Save failed', ins.error?.message ?? 'Nudge insert failed')
       } else {
         await refreshAll()
         setNudgeModalOpen(false)
         setPendingCreate(null)
         setEditNudge(null)
         setTapDraft(null)
+        showToast('Nudge saved!')
       }
     },
-    [refreshAll, user?.id],
+    [refreshAll, showToast],
   )
 
   const deleteNudge = useCallback(
@@ -682,7 +719,14 @@ function MapScreenBody({
           style: 'destructive',
           onPress: async () => {
             const res = await deleteNudgeForUser(uid, id)
-            if (!res.error) await refreshAll()
+            if (!res.error) {
+              await refreshAll()
+              setNudgeModalOpen(false)
+              setEditNudge(null)
+              setNudgeEditPrompt(null)
+              setTapDraft(null)
+              setPendingCreate(null)
+            }
           },
         },
       ])
@@ -782,8 +826,13 @@ function MapScreenBody({
             top: 0,
             right: 0,
             left: 0,
-            bottom: 60,
+            bottom: 80,
           }}
+          legalLabelInsets={Platform.select({
+            android: { bottom: 60, right: 200, top: 0, left: 0 },
+            ios: { top: insets.top + 64, left: 12, bottom: 0, right: 0 },
+            default: { bottom: 0, left: 0, top: 0, right: 0 },
+          })}
           toolbarEnabled={false}
           initialRegion={mapInitialRegionRef.current}
           onRegionChangeComplete={handleRegionChangeComplete}
@@ -806,7 +855,6 @@ function MapScreenBody({
             />
             <Marker
               coordinate={{ latitude: homeRow.lat, longitude: homeRow.lng }}
-              title={homeRow.name}
               tracksViewChanges={MARKER_TRACKS_SIMPLE}
             >
               <View style={styles.homePin}><Ionicons name="home" size={14} color="#0a0a0a" /></View>
@@ -831,7 +879,6 @@ function MapScreenBody({
             <Marker
               key={item.key}
               coordinate={{ latitude: item.poi.lat, longitude: item.poi.lng }}
-              title={item.poi.label}
               tracksViewChanges={MARKER_TRACKS_POI_CHANGES}
               onPress={() => {
                 setNudgeEditPrompt(null)
@@ -907,12 +954,10 @@ function MapScreenBody({
       </MapView>
       </View>
       <View style={[styles.searchWrap, { top: insets.top + 12 }]} pointerEvents="box-none">
-        <View style={styles.searchCard}>
+        <View style={styles.searchCard} pointerEvents="auto">
           <GooglePlacesAddressSearchField
             variant="mapBar"
-            value={searchQuery}
-            onChangeText={(t) => {
-              setSearchQuery(t)
+            onSearchTextChange={(t) => {
               if (!t.trim()) setSearchAnchor(null)
             }}
             enabled
@@ -923,7 +968,6 @@ function MapScreenBody({
             mapLat={mapSearchLat}
             mapLng={mapSearchLng}
             onSelect={(r) => {
-              setSearchQuery('')
               setSearchAnchor({ lat: r.lat, lng: r.lng })
               setPendingCreate({
                 lat: r.lat,
@@ -957,11 +1001,6 @@ function MapScreenBody({
         pointerEvents="box-none"
       >
         <View style={styles.bottomFloatingColumn} pointerEvents="box-none">
-          {bottomPromptCard ? (
-            <View style={styles.bottomPromptSlot} pointerEvents="auto">
-              {bottomPromptCard}
-            </View>
-          ) : null}
           {showPoiLoadingStrip ? (
             <View style={styles.poiLoadingStackBlock} pointerEvents="none">
               <Text style={styles.poiLoadingTitle}>Loading nearby places...</Text>
@@ -973,11 +1012,17 @@ function MapScreenBody({
               </View>
             </View>
           ) : null}
+          {bottomPromptCard ? (
+            <View style={styles.bottomPromptSlot} pointerEvents="auto">
+              {bottomPromptCard}
+            </View>
+          ) : null}
           <View style={styles.controlsInner} pointerEvents="box-none">
             <View style={styles.filterRowCombined}>
-              <Pressable onPress={toggleAllCategoryFilters} style={styles.filterAllNoneBtn} hitSlop={6}>
-                <Text style={styles.filterAllNoneBtnText}>{allFiltersActive ? 'None' : 'All'}</Text>
-              </Pressable>
+              <View style={styles.filterLabelRow} pointerEvents="none">
+                <Ionicons name="options-outline" size={17} color="#fff" style={styles.filterOptionsIcon} />
+                <Text style={styles.filterLabelText}>Filter</Text>
+              </View>
               <ScrollView
                 horizontal
                 showsHorizontalScrollIndicator={false}
@@ -1006,10 +1051,9 @@ function MapScreenBody({
                   )
                 })}
               </ScrollView>
-              <View style={styles.filterLabelRow} pointerEvents="none">
-                <Ionicons name="options-outline" size={17} color="#fff" style={styles.filterOptionsIcon} />
-                <Text style={styles.filterLabelText}>Filter</Text>
-              </View>
+              <Pressable onPress={toggleAllCategoryFilters} style={styles.filterAllNoneBtn} hitSlop={6}>
+                <Text style={styles.filterAllNoneBtnText}>{allFiltersActive ? 'None' : 'All'}</Text>
+              </Pressable>
             </View>
           </View>
         </View>
@@ -1085,16 +1129,17 @@ function MapScreenBody({
         onDraftNameChange={(name) => setHomeDraft((d) => (d ? { ...d, name } : d))}
         onDismissSecondary={() => {
           setHomeGateOpen(false)
-          homeGateDismissedRef.current = true
+          if (homeRow != null) homeGateDismissedRef.current = true
         }}
         onStartMapPick={() => {
           setHomeMapPickActive(true)
           setHomeGateOpen(false)
         }}
         onSave={async () => {
-          if (!user?.id || !homeDraft) return
+          if (!homeDraft) return
+          const uid = effectiveUserId(user?.id)
           setHomeSaving(true)
-          const res = await upsertUserHome(user.id, {
+          const res = await upsertUserHome(uid, {
             name: homeDraft.name,
             lat: homeDraft.lat,
             lng: homeDraft.lng,
@@ -1110,15 +1155,12 @@ function MapScreenBody({
           }
         }}
         saving={homeSaving}
-        searchQuery={homeSearchQuery}
-        onSearchQueryChange={setHomeSearchQuery}
         onSelectSearchResult={(r) => {
           setHomeDraft({
             lat: r.lat,
             lng: r.lng,
             name: (r.display_name || r.name).trim() || 'Home',
           })
-          setHomeSearchQuery('')
           setHomeGateOpen(true)
         }}
       />
@@ -1148,6 +1190,11 @@ function MapScreenBody({
           <Text style={styles.leaveHomeQuickText}>Add leaving-home nudge</Text>
         </Pressable>
       ) : null}
+      <NudgeToast
+        visible={toastVisible}
+        message={toastMessage}
+        onHide={() => setToastVisible(false)}
+      />
       </View>
     </AppTiledBackground>
   )
@@ -1295,10 +1342,17 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: 8,
     paddingBottom: 4,
-    gap: 8,
+    gap: 6,
+    overflow: 'hidden',
   },
-  chipsScroll: { flex: 1, flexGrow: 1, minWidth: 0 },
-  filterLabelRow: { flexDirection: 'row', alignItems: 'center', gap: 6, flexShrink: 0 },
+  chipsScroll: { flex: 1, minWidth: 0 },
+  filterLabelRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flexShrink: 0,
+    marginRight: 4,
+  },
   filterOptionsIcon: {
     ...MAP_OVERLAY_TEXT_SHADOW,
   },

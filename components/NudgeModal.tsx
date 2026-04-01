@@ -3,8 +3,6 @@ import { Ionicons } from '@expo/vector-icons'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
   ActivityIndicator,
-  Alert,
-  KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
@@ -19,7 +17,6 @@ import { CATEGORIES } from '../lib/categories'
 import { RADIUS_STEPS_METERS, snapMetersToStep, type RadiusMeters } from '../lib/nudge-radius'
 import { CategoryIcon } from './CategoryIcon'
 import { AppLogo } from './AppLogo'
-import { AppTiledBackground } from './AppTiledBackground'
 import { TriggerGlyph, type NudgeTrigger } from './TriggerGlyph'
 
 const BG = '#0a0a0a'
@@ -189,6 +186,11 @@ export default function NudgeModal({
       return
     }
     setTitleError(null)
+    console.log('[NudgeModal save payload]', {
+      title: formData.title,
+      notes: formData.notes,
+      notesLen: formData.notes?.length,
+    })
     onSave({
       ...formData,
       coordinates: formData.coordinates,
@@ -201,14 +203,7 @@ export default function NudgeModal({
 
   const handleDelete = () => {
     if (!editNudge || !onDelete) return
-    Alert.alert('Are you sure?', 'This nudge will be permanently deleted.', [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Delete',
-        style: 'destructive',
-        onPress: () => onDelete(editNudge.id),
-      },
-    ])
+    onDelete(editNudge.id)
   }
 
   const setCategory = (v: string) => {
@@ -219,12 +214,15 @@ export default function NudgeModal({
   const mapPreview = visualPreset === 'mapGeofencePreview'
 
   return (
-    <Modal visible={isOpen} animationType="slide" transparent onRequestClose={onClose}>
-      <AppTiledBackground>
-        <KeyboardAvoidingView
-          style={styles.backdrop}
-          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        >
+    <Modal
+      visible={isOpen}
+      animationType="slide"
+      transparent
+      statusBarTranslucent={true}
+      onRequestClose={onClose}
+    >
+      <View style={{ flex: 1 }}>
+        <View style={styles.backdrop}>
           <Pressable
             style={[styles.backdropDim, mapPreview && styles.backdropDimMapPreview]}
             onPress={onClose}
@@ -256,7 +254,9 @@ export default function NudgeModal({
             style={styles.scroll}
             contentContainerStyle={styles.scrollContent}
             keyboardShouldPersistTaps="handled"
-            showsVerticalScrollIndicator
+            keyboardDismissMode="interactive"
+            showsVerticalScrollIndicator={true}
+            automaticallyAdjustKeyboardInsets={true}
           >
             <Text style={styles.label}>Title</Text>
             <TextInput
@@ -372,26 +372,25 @@ export default function NudgeModal({
                 </View>
               </>
             ) : null}
-          </ScrollView>
-
-          <View style={styles.footer}>
-            <Pressable onPress={handleSave} style={styles.btnPrimary}>
-              <Text style={styles.btnPrimaryText}>{isEdit ? 'Save Changes' : 'Save'}</Text>
-            </Pressable>
-            <Pressable onPress={onClose} style={styles.btnGhost}>
-              <Text style={styles.btnGhostText}>Cancel</Text>
-            </Pressable>
-            {isEdit && onDelete ? (
-              <Pressable onPress={handleDelete} style={styles.btnDanger}>
-                <Text style={styles.btnDangerText}>Delete</Text>
+            <View style={styles.footer}>
+              <Pressable onPress={handleSave} style={styles.btnPrimary}>
+                <Text style={styles.btnPrimaryText}>{isEdit ? 'Save Changes' : 'Save'}</Text>
               </Pressable>
-            ) : null}
-          </View>
+              <Pressable onPress={onClose} style={styles.btnGhost}>
+                <Text style={styles.btnGhostText}>Cancel</Text>
+              </Pressable>
+              {isEdit && onDelete ? (
+                <Pressable onPress={handleDelete} style={styles.btnDanger}>
+                  <Text style={styles.btnDangerText}>Delete</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          </ScrollView>
             </>
           )}
           </View>
-        </KeyboardAvoidingView>
-      </AppTiledBackground>
+        </View>
+      </View>
     </Modal>
   )
 }
@@ -400,6 +399,7 @@ const styles = StyleSheet.create({
   backdrop: { flex: 1, justifyContent: 'flex-end' },
   backdropDim: {
     ...StyleSheet.absoluteFillObject,
+    top: 0,
     backgroundColor: 'rgba(0,0,0,0.65)',
   },
   backdropDimMapPreview: {
@@ -413,13 +413,13 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 24,
     borderTopWidth: 1,
     borderColor: BORDER_MUTED,
-    maxHeight: '88%',
-    minHeight: '55%',
-    paddingBottom: Platform.select({ ios: 28, default: 20 }),
+    maxHeight: '95%',
+    minHeight: '80%',
+    paddingBottom: Platform.select({ ios: 28, default: 8 }),
   },
   sheetMapPreview: {
-    maxHeight: '62%',
-    minHeight: '42%',
+    maxHeight: '75%',
+    minHeight: '65%',
   },
   sheetHeader: {
     position: 'relative',
@@ -452,7 +452,7 @@ const styles = StyleSheet.create({
   heading: { color: '#fff', fontSize: 20, fontWeight: '700' },
   subtitle: { color: MUTED, fontSize: 14, marginTop: 4 },
   scroll: { flexGrow: 1, flexShrink: 1 },
-  scrollContent: { paddingHorizontal: 20, paddingBottom: 24 },
+  scrollContent: { paddingHorizontal: 20, paddingBottom: 32 },
   label: {
     color: MUTED,
     fontSize: 12,
@@ -540,10 +540,8 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0, 191, 165, 0.2)',
   },
   footer: {
-    paddingHorizontal: 20,
-    paddingTop: 12,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: BORDER_MUTED,
+    paddingTop: 16,
+    paddingBottom: 8,
     gap: 10,
   },
   btnPrimary: {

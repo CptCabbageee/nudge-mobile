@@ -1,7 +1,7 @@
 import type { MapPoi } from './poi-fetch'
 
 /** Cluster radius: POIs within this distance merge into one pill (all categories). */
-const CLUSTER_RADIUS_METERS = 250
+const CLUSTER_RADIUS_METERS = 180
 
 export type PoiClusterRenderItem =
   | { kind: 'single'; key: string; poi: MapPoi }

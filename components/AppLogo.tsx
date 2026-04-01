@@ -1,26 +1,25 @@
-import { Image } from 'expo-image'
+import { Image, View } from 'react-native'
 
 type AppLogoProps = {
-  /** Header / modal = 60; full-screen splash / auth = 120 */
   size?: 60 | 120
 }
 
-/**
- * Logo asset: expo-image preserves PNG alpha on Android better than RN Image.
- */
 export function AppLogo({ size = 120 }: AppLogoProps) {
   return (
-    <Image
-      source={require('../assets/images/logo.png')}
-      style={{ width: size, height: size }}
-      contentFit="contain"
-      transition={0}
-      tintColor={undefined}
-      cachePolicy="memory-disk"
-      allowDownscaling={false}
-      accessible={false}
-      accessibilityElementsHidden
-      importantForAccessibility="no-hide-descendants"
-    />
+    <View
+      style={{
+        width: size,
+        height: size,
+        backgroundColor: 'transparent',
+        overflow: 'hidden',
+        borderRadius: size / 2,
+      }}
+    >
+      <Image
+        source={require('../assets/images/logo.png')}
+        style={{ width: size, height: size, backgroundColor: 'transparent' }}
+        resizeMode="contain"
+      />
+    </View>
   )
 }

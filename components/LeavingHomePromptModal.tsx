@@ -8,7 +8,6 @@ import {
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
 import { AppLogo } from './AppLogo'
-import { AppTiledBackground } from './AppTiledBackground'
 
 const BG = '#141414'
 const ACCENT = '#00BFA5'
@@ -29,7 +28,7 @@ export function LeavingHomePromptModal({ visible, onYes, onNo }: Props) {
 
   return (
     <Modal visible={visible} animationType="fade" transparent onRequestClose={() => onNo(dontAskAgain)}>
-      <AppTiledBackground>
+      <View style={{ flex: 1, backgroundColor: 'transparent' }}>
         <View style={styles.overlay}>
           <View style={styles.card}>
             <View style={styles.logoHeaderWrap}>
@@ -60,7 +59,7 @@ export function LeavingHomePromptModal({ visible, onYes, onNo }: Props) {
             </View>
           </View>
         </View>
-      </AppTiledBackground>
+      </View>
     </Modal>
   )
 }

@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -12,7 +13,6 @@ import {
 } from 'react-native'
 import type { SearchResult } from '../types'
 import { AppLogo } from './AppLogo'
-import { AppTiledBackground } from './AppTiledBackground'
 import { GooglePlacesAddressSearchField } from './GooglePlacesAddressSearchField'
 
 const BG = '#0a0a0a'
@@ -34,8 +34,6 @@ type Props = {
   onStartMapPick: () => void
   onSave: () => void
   saving: boolean
-  searchQuery: string
-  onSearchQueryChange: (q: string) => void
   onSelectSearchResult: (r: SearchResult) => void
   mapLat: number
   mapLng: number
@@ -51,12 +49,16 @@ export function HomeLocationGateModal({
   onStartMapPick,
   onSave,
   saving,
-  searchQuery,
-  onSearchQueryChange,
   onSelectSearchResult,
   mapLat,
   mapLng,
 }: Props) {
+  const [searchQuery, setSearchQuery] = useState('')
+
+  useEffect(() => {
+    if (!visible) setSearchQuery('')
+  }, [visible])
+
   const canSave = draft != null && draft.name.trim().length > 0
   const isEdit = variant === 'edit'
   const title = isEdit ? 'Edit home' : 'Set your home'
@@ -68,7 +70,7 @@ export function HomeLocationGateModal({
 
   return (
     <Modal visible={visible} animationType="fade" transparent onRequestClose={onDismissSecondary}>
-      <AppTiledBackground>
+      <View style={{ flex: 1, backgroundColor: 'transparent' }}>
         <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
           <View style={styles.overlay}>
             <View style={styles.card}>
@@ -93,7 +95,7 @@ export function HomeLocationGateModal({
                 <GooglePlacesAddressSearchField
                   variant="form"
                   value={searchQuery}
-                  onChangeText={onSearchQueryChange}
+                  onChangeText={setSearchQuery}
                   enabled={visible && !mapPickActive}
                   placeholder="Street, postcode, place…"
                   accentColor={ACCENT}
@@ -101,11 +103,29 @@ export function HomeLocationGateModal({
                   mapLat={mapLat}
                   mapLng={mapLng}
                   onSelect={(r) => {
-                    onSearchQueryChange('')
+                    setSearchQuery('')
                     onSelectSearchResult(r)
                   }}
                   formInputStyle={styles.input}
                 />
+
+                {searchQuery.trim().length >= 3 && !draft ? (
+                  <Pressable
+                    style={styles.fallbackGeoBtn}
+                    onPress={() => {
+                      const label = searchQuery.trim()
+                      setSearchQuery('')
+                      onSelectSearchResult({
+                        lat: mapLat,
+                        lng: mapLng,
+                        name: label,
+                        display_name: label,
+                      })
+                    }}
+                  >
+                    <Text style={styles.fallbackGeoBtnText}>Use current map location with this label</Text>
+                  </Pressable>
+                ) : null}
 
                 <Pressable style={styles.mapPickBtn} onPress={onStartMapPick}>
                   <Text style={styles.mapPickBtnText}>Tap map to set location</Text>
@@ -144,7 +164,7 @@ export function HomeLocationGateModal({
             </View>
           </View>
         </KeyboardAvoidingView>
-      </AppTiledBackground>
+      </View>
     </Modal>
   )
 }
@@ -193,6 +213,16 @@ const styles = StyleSheet.create({
     borderColor: ACCENT,
     alignItems: 'center',
   },
+  fallbackGeoBtn: {
+    marginTop: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    backgroundColor: 'rgba(0,191,165,0.15)',
+    borderWidth: 1,
+    borderColor: 'rgba(0,191,165,0.45)',
+  },
+  fallbackGeoBtnText: { color: ACCENT, fontSize: 14, fontWeight: '700', textAlign: 'center' },
   mapPickBtnText: { color: ACCENT, fontSize: 15, fontWeight: '700' },
   actions: { flexDirection: 'row', gap: 12, marginTop: 18 },
   skipBtn: {
