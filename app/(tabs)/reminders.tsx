@@ -6,6 +6,7 @@ import { AppLogo } from '../../components/AppLogo'
 import { AppTiledBackground } from '../../components/AppTiledBackground'
 import NudgeList from '../../components/NudgeList'
 import NudgeModal, { type NudgeSavePayload } from '../../components/NudgeModal'
+import { NudgeToast } from '../../components/NudgeToast'
 import { useAuth } from '../../context/AuthContext'
 import { effectiveUserId } from '../../lib/dev-user'
 import { deleteNudgeForUser, fetchUserNudges, updateNudgeForUser } from '../../lib/nudge-queries'
@@ -19,6 +20,14 @@ export default function RemindersScreen() {
   const [editNudge, setEditNudge] = useState<(typeof nudges)[number] | null>(null)
   const [radiusMeters, setRadiusMeters] = useState(25)
   const [modalOpen, setModalOpen] = useState(false)
+  const [editKey, setEditKey] = useState(0)
+  const [toastMessage, setToastMessage] = useState('')
+  const [toastVisible, setToastVisible] = useState(false)
+
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg)
+    setToastVisible(true)
+  }, [])
 
   const refresh = useCallback(async () => {
     const uid = effectiveUserId(user?.id)
@@ -43,12 +52,16 @@ export default function RemindersScreen() {
           style: 'destructive',
           onPress: async () => {
             const res = await deleteNudgeForUser(uid, id)
-            if (!res.error) await refresh()
+            if (!res.error) {
+              await refresh()
+              setToastMessage('Nudge deleted')
+              setToastVisible(true)
+            }
           },
         },
       ])
     },
-    [refresh, user?.id],
+    [refresh, showToast, user?.id],
   )
 
   const onSave = useCallback(
@@ -57,12 +70,15 @@ export default function RemindersScreen() {
       const uid = effectiveUserId(user?.id)
       const res = await updateNudgeForUser(uid, payload.nudgeId, payload.locationId, payload)
       if (!res.error) {
-        setModalOpen(false)
         await refresh()
-        setTimeout(() => setEditNudge(null), 300)
+        setEditNudge(null)
+        setEditKey((k) => k + 1)
+        setModalOpen(false)
+        setToastMessage('Nudge saved!')
+        setToastVisible(true)
       }
     },
-    [refresh],
+    [refresh, showToast],
   )
 
   const listData = useMemo(() => nudges, [nudges])
@@ -79,11 +95,13 @@ export default function RemindersScreen() {
           onEdit={(n) => {
             setEditNudge(n)
             setRadiusMeters(n.radius_meters)
+            setEditKey((k) => k + 1)
             setModalOpen(true)
           }}
           onDelete={onDelete}
         />
         <NudgeModal
+          key={editKey}
           isOpen={modalOpen}
           onClose={() => {
             setModalOpen(false)
@@ -94,6 +112,11 @@ export default function RemindersScreen() {
           editNudge={editNudge}
           radiusMeters={radiusMeters}
           onRadiusMetersChange={setRadiusMeters}
+        />
+        <NudgeToast
+          visible={toastVisible}
+          message={toastMessage}
+          onHide={() => setToastVisible(false)}
         />
       </SafeAreaView>
     </AppTiledBackground>

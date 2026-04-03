@@ -11,6 +11,7 @@ import {
 import { AppState, type AppStateStatus } from 'react-native'
 import { LeavingHomePromptModal } from '../components/LeavingHomePromptModal'
 import { fetchUserHome, type UserHomeRow } from '../lib/home-queries'
+import { effectiveUserId } from '../lib/dev-user'
 import { hasLeavingHomeNudge } from '../lib/nudge-queries'
 import { markLeavingHomeNeverAskAgain, shouldSuppressLeavingHomePrompt } from '../lib/leaving-home-prompt'
 import { useAuth } from './AuthContext'
@@ -52,12 +53,12 @@ export function LeavingHomePromptProvider({ children }: { children: ReactNode })
   }, [])
 
   const runCheck = useCallback(async () => {
-    if (!user?.id) return
     if (runningRef.current) return
     if (checkedRef.current) return
     runningRef.current = true
     try {
-      const { data: home } = await fetchUserHome(user.id)
+      const uid = effectiveUserId(user?.id)
+      const { data: home } = await fetchUserHome(uid)
       homeRowRef.current = home
       setHomeRow(home)
       if (!home) {
@@ -68,7 +69,7 @@ export function LeavingHomePromptProvider({ children }: { children: ReactNode })
         checkedRef.current = true
         return
       }
-      if (await hasLeavingHomeNudge(user.id, home.id)) {
+      if (await hasLeavingHomeNudge(uid, home.id)) {
         checkedRef.current = true
         return
       }

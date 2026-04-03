@@ -101,3 +101,9 @@ export async function putPoiAreaCache(areaKey: string, pois: MapPoi[]): Promise<
     [areaKey, json, now],
   )
 }
+
+/** Clears all cached POI area rows (e.g. after fixing empty-cache poisoning). */
+export async function clearAllPoiAreaCache(): Promise<void> {
+  const db = await getDb()
+  await db.runAsync('DELETE FROM poi_area_cache')
+}

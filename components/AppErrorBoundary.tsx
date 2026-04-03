@@ -68,7 +68,11 @@ export class AppErrorBoundary extends Component<Props, State> {
           <View style={styles.root}>
             <Text style={styles.title}>Something went wrong</Text>
             <Text style={styles.message}>{err.name}: {err.message}</Text>
-            <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollInner}>
+            <ScrollView
+              style={styles.scroll}
+              contentContainerStyle={styles.scrollInner}
+              keyboardShouldPersistTaps="handled"
+            >
               {err.stack ? (
                 <Text selectable style={styles.mono}>
                   {err.stack}

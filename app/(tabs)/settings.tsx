@@ -2,7 +2,19 @@ import { useFocusEffect } from 'expo-router'
 import DateTimePicker, { type DateTimePickerEvent } from '@react-native-community/datetimepicker'
 import * as Location from 'expo-location'
 import { useCallback, useMemo, useState } from 'react'
-import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native'
+import {
+  ActivityIndicator,
+  Alert,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Switch,
+  Text,
+  TextInput,
+  View,
+} from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { Ionicons } from '@expo/vector-icons'
 import { AppLogo } from '../../components/AppLogo'
@@ -10,6 +22,7 @@ import { AppTiledBackground } from '../../components/AppTiledBackground'
 import { SettingsHomeEditModal } from '../../components/SettingsHomeEditModal'
 import { useAuth } from '../../context/AuthContext'
 import { deleteAllUserApplicationData } from '../../lib/account-deletion'
+import { effectiveUserId } from '../../lib/dev-user'
 import { deleteUserHome, fetchUserHome, upsertUserHome, type UserHomeRow } from '../../lib/home-queries'
 import { fetchUserNudges } from '../../lib/nudge-queries'
 import { fetchProfileByUserId, upsertProfile } from '../../lib/profile-queries'
@@ -62,21 +75,21 @@ export default function SettingsScreen() {
   const [showDobPicker, setShowDobPicker] = useState(false)
 
   const refresh = useCallback(async () => {
-    if (!user?.id) return
+    const uid = effectiveUserId(user?.id)
     const [nRes, homeRes, notifPref, mapStyle, radius] = await Promise.all([
-      fetchUserNudges(user.id),
-      fetchUserHome(user.id),
+      fetchUserNudges(uid),
+      fetchUserHome(uid),
       loadNotificationPreferences(),
       loadMapStylePreference(),
       loadDefaultRadiusMeters(),
     ])
     if (!nRes.error) setNudgesCount(nRes.data.length)
     if (!homeRes.error) setHomeRow(homeRes.data)
-    const profileRes = await fetchProfileByUserId(user.id)
+    const profileRes = await fetchProfileByUserId(uid)
     setProfileDraft({
       firstName: profileRes.data?.first_name?.trim() || '',
       lastName: profileRes.data?.last_name?.trim() || '',
-      email: user.email?.trim() || '',
+      email: user?.email?.trim() || '',
       phone: profileRes.data?.phone?.trim() || '',
       dateOfBirth: profileRes.data?.date_of_birth?.trim() || '',
     })
@@ -98,7 +111,7 @@ export default function SettingsScreen() {
     } else {
       setUserCoords(null)
     }
-  }, [user?.id])
+  }, [user?.id, user?.email])
 
   useFocusEffect(
     useCallback(() => {
@@ -120,11 +133,12 @@ export default function SettingsScreen() {
   }, [profileDraft, user?.email])
 
   const saveProfile = useCallback(async () => {
-    if (!user?.id || savingProfile) return
+    if (savingProfile) return
+    const uid = effectiveUserId(user?.id)
     setSavingProfile(true)
     try {
       const nextEmail = profileDraft.email.trim()
-      if (nextEmail && nextEmail !== (user.email?.trim() || '')) {
+      if (nextEmail && nextEmail !== (user?.email?.trim() || '')) {
         const { error: updateEmailError } = await supabase.auth.updateUser({ email: nextEmail })
         if (updateEmailError) {
           Alert.alert('Could not update email', updateEmailError.message)
@@ -134,7 +148,7 @@ export default function SettingsScreen() {
       }
 
       const profileRes = await upsertProfile({
-        id: user.id,
+        id: uid,
         first_name: profileDraft.firstName.trim() || null,
         last_name: profileDraft.lastName.trim() || null,
         phone: profileDraft.phone.trim() || null,
@@ -149,12 +163,19 @@ export default function SettingsScreen() {
     } finally {
       setSavingProfile(false)
     }
-  }, [user?.id, user?.email, profileDraft, refresh, savingProfile])
+  }, [user?.email, profileDraft, refresh, savingProfile])
 
   return (
     <AppTiledBackground>
       <SafeAreaView style={styles.root}>
-        <ScrollView contentContainerStyle={styles.content}>
+        <KeyboardAvoidingView
+          style={styles.keyboardAvoid}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        >
+        <ScrollView
+          contentContainerStyle={styles.content}
+          keyboardShouldPersistTaps="handled"
+        >
         <View style={styles.screenHeader}>
           <AppLogo size={60} />
           <Text style={styles.screenTitle}>Settings</Text>
@@ -229,8 +250,9 @@ export default function SettingsScreen() {
             <Pressable
               style={[styles.btnOutline, styles.btnDanger]}
               onPress={async () => {
-                if (!user?.id || !homeRow?.id) return
-                const res = await deleteUserHome(user.id, homeRow.id)
+                if (!homeRow?.id) return
+                const uid = effectiveUserId(user?.id)
+                const res = await deleteUserHome(uid, homeRow.id)
                 if (!res.error) await refresh()
               }}
             >
@@ -303,14 +325,14 @@ export default function SettingsScreen() {
         <Pressable
           style={[styles.signOut, styles.deleteAll]}
           onPress={() => {
-            if (!user?.id) return
+            const uid = effectiveUserId(user?.id)
             Alert.alert('Delete all app data?', 'This deletes your nudges and locations.', [
               { text: 'Cancel', style: 'cancel' },
               {
                 text: 'Delete',
                 style: 'destructive',
                 onPress: async () => {
-                  const res = await deleteAllUserApplicationData(user.id)
+                  const res = await deleteAllUserApplicationData(uid)
                   if (!res.error) await refresh()
                 },
               },
@@ -321,6 +343,7 @@ export default function SettingsScreen() {
           <Text style={styles.deleteAllText}>Delete app data</Text>
           </Pressable>
         </ScrollView>
+        </KeyboardAvoidingView>
 
         <SettingsHomeEditModal
           visible={editHomeOpen}
@@ -328,9 +351,9 @@ export default function SettingsScreen() {
           userCoords={userCoords}
           onDismiss={() => setEditHomeOpen(false)}
           onSave={async (draft) => {
-            if (!user?.id) return
+            const uid = effectiveUserId(user?.id)
             setSavingHome(true)
-            const res = await upsertUserHome(user.id, {
+            const res = await upsertUserHome(uid, {
               name: draft.name,
               lat: draft.lat,
               lng: draft.lng,
@@ -375,6 +398,7 @@ function RowSwitch({ label, value, onChange }: { label: string; value: boolean; 
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: 'transparent' },
+  keyboardAvoid: { flex: 1 },
   screenHeader: { alignItems: 'center', marginBottom: 4 },
   screenTitle: { color: '#fff', fontSize: 22, fontWeight: '800', marginTop: 6 },
   content: { padding: 16, gap: 12, paddingBottom: 36 },

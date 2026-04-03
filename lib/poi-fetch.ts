@@ -45,7 +45,7 @@ export const NOMINATIM_POI_QUERIES: { q: string; filterCategory: string; display
 
 /** One Nominatim request per entry; sequential with delay between calls (rate limit). */
 export const POI_FETCH_TOTAL = NOMINATIM_POI_QUERIES.length
-export const POI_FETCH_DELAY_MS = 1100
+export const POI_FETCH_DELAY_MS = 300
 export const POI_REFETCH_MIN_DISTANCE_M = 500
 const POI_SKIP_NEAR_NUDGE_M = 20
 
@@ -172,7 +172,7 @@ let poiFetchRunSerial = 0
 
 /**
  * Fetches POIs via sequential Nominatim queries. Calls `onProgress` after each step; calls `onBatch`
- * once at the end with the full accumulated list (avoids N state updates per run). Never rejects.
+ * after each step with the accumulated list so the map can update progressively. Never rejects.
  */
 export async function fetchNearbyPoisSequential(
   lat: number,
@@ -242,14 +242,16 @@ export async function fetchNearbyPoisSequential(
       const done = i + 1
       const stillRunning = done < totalSteps && !signal.aborted && runId === poiFetchRunSerial
       report(done, stillRunning)
+      if (!signal.aborted && runId === poiFetchRunSerial && accumulated.length > 0) {
+        try {
+          onBatch(accumulated)
+        } catch {
+          /* ignore */
+        }
+      }
     }
 
     if (!signal.aborted && runId === poiFetchRunSerial) {
-      try {
-        onBatch(accumulated)
-      } catch {
-        /* ignore */
-      }
       try {
         onComplete?.(lat, lng)
       } catch {

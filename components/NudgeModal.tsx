@@ -1,8 +1,9 @@
 import Slider from '@react-native-community/slider'
 import { Ionicons } from '@expo/vector-icons'
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
   ActivityIndicator,
+  Animated,
   Modal,
   Platform,
   Pressable,
@@ -17,6 +18,7 @@ import { CATEGORIES } from '../lib/categories'
 import { RADIUS_STEPS_METERS, snapMetersToStep, type RadiusMeters } from '../lib/nudge-radius'
 import { CategoryIcon } from './CategoryIcon'
 import { AppLogo } from './AppLogo'
+import { NudgeToast } from './NudgeToast'
 import { TriggerGlyph, type NudgeTrigger } from './TriggerGlyph'
 
 const BG = '#0a0a0a'
@@ -96,6 +98,27 @@ export default function NudgeModal({
 }: NudgeModalProps) {
   const [formData, setFormData] = useState<FormCore | null>(null)
   const [titleError, setTitleError] = useState<string | null>(null)
+  const [validationBanner, setValidationBanner] = useState<string | null>(null)
+  const [toastVisible, setToastVisible] = useState(false)
+  const [toastMessage, setToastMessage] = useState('')
+  const validationBannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const shakeAnim = useRef(new Animated.Value(0)).current
+  const scrollViewRef = useRef<ScrollView>(null)
+
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg)
+    setToastVisible(true)
+  }, [])
+
+  const shake = useCallback(() => {
+    Animated.sequence([
+      Animated.timing(shakeAnim, { toValue: 8, duration: 60, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: -8, duration: 60, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: 6, duration: 60, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: -6, duration: 60, useNativeDriver: true }),
+      Animated.timing(shakeAnim, { toValue: 0, duration: 60, useNativeDriver: true }),
+    ]).start()
+  }, [shakeAnim])
 
   const onRadiusMetersChangeRef = useRef(onRadiusMetersChange)
   onRadiusMetersChangeRef.current = onRadiusMetersChange
@@ -105,6 +128,21 @@ export default function NudgeModal({
       onRadiusMetersChangeRef.current(snapMetersToStep(editNudge.radius_meters))
     }
   }, [isOpen, editNudge?.id, editNudge?.radius_meters])
+
+  useEffect(() => {
+    return () => {
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isOpen) {
+      if (validationBannerTimerRef.current) {
+        clearTimeout(validationBannerTimerRef.current)
+      }
+      setToastVisible(false)
+      setToastMessage('')
+    }
+  }, [isOpen])
 
   useLayoutEffect(() => {
     if (!isOpen) {
@@ -182,15 +220,11 @@ export default function NudgeModal({
     console.log('[NudgeModal handleSave] start', { hasFormData: Boolean(formData) })
     if (!formData) return
     if (!formData.title.trim()) {
-      setTitleError('Please add a title')
+      setTitleError('Please add a name')
+      showToast('Please add a name')
       return
     }
     setTitleError(null)
-    console.log('[NudgeModal save payload]', {
-      title: formData.title,
-      notes: formData.notes,
-      notesLen: formData.notes?.length,
-    })
     onSave({
       ...formData,
       coordinates: formData.coordinates,
@@ -251,6 +285,7 @@ export default function NudgeModal({
           </View>
 
           <ScrollView
+            ref={scrollViewRef}
             style={styles.scroll}
             contentContainerStyle={styles.scrollContent}
             keyboardShouldPersistTaps="handled"
@@ -259,17 +294,23 @@ export default function NudgeModal({
             automaticallyAdjustKeyboardInsets={true}
           >
             <Text style={styles.label}>Title</Text>
-            <TextInput
-              placeholder="What do you need to remember?"
-              placeholderTextColor={MUTED}
-              value={formData.title}
-              onChangeText={(t) => {
-                setTitleError(null)
-                setFormData((prev) => (prev ? { ...prev, title: t } : prev))
-              }}
-              style={[styles.input, titleError && styles.inputError]}
-            />
-            {titleError ? <Text style={styles.fieldError}>{titleError}</Text> : null}
+            <Animated.View style={{ transform: [{ translateX: shakeAnim }] }}>
+              <TextInput
+                placeholder="What do you need to remember?"
+                placeholderTextColor={MUTED}
+                value={formData.title}
+                onChangeText={(t) => {
+                  setTitleError(null)
+                  setFormData((prev) => (prev ? { ...prev, title: t } : prev))
+                }}
+                onFocus={() => {
+                  setTimeout(() => {
+                    scrollViewRef.current?.scrollTo({ y: 0, animated: true })
+                  }, 300)
+                }}
+                style={[styles.input, titleError && styles.inputError]}
+              />
+            </Animated.View>
 
             <Text style={styles.label}>Notes</Text>
             <TextInput
@@ -277,6 +318,11 @@ export default function NudgeModal({
               placeholderTextColor={MUTED}
               value={formData.notes}
               onChangeText={(t) => setFormData((prev) => (prev ? { ...prev, notes: t } : prev))}
+              onFocus={() => {
+                setTimeout(() => {
+                  scrollViewRef.current?.scrollTo({ y: 120, animated: true })
+                }, 300)
+              }}
               style={[styles.input, styles.textarea]}
               multiline
               textAlignVertical="top"
@@ -373,7 +419,10 @@ export default function NudgeModal({
               </>
             ) : null}
             <View style={styles.footer}>
-              <Pressable onPress={handleSave} style={styles.btnPrimary}>
+              <Pressable
+                onPress={handleSave}
+                style={[styles.btnPrimary, titleError ? { backgroundColor: '#ef4444' } : null]}
+              >
                 <Text style={styles.btnPrimaryText}>{isEdit ? 'Save Changes' : 'Save'}</Text>
               </Pressable>
               <Pressable onPress={onClose} style={styles.btnGhost}>
@@ -388,8 +437,18 @@ export default function NudgeModal({
           </ScrollView>
             </>
           )}
+          {validationBanner ? (
+            <View style={styles.validationBanner} pointerEvents="none">
+              <Text style={styles.validationBannerText}>{validationBanner}</Text>
+            </View>
+          ) : null}
           </View>
         </View>
+        <NudgeToast
+          visible={toastVisible}
+          message={toastMessage}
+          onHide={() => setToastVisible(false)}
+        />
       </View>
     </Modal>
   )
@@ -432,7 +491,25 @@ const styles = StyleSheet.create({
     width: 40,
     height: 4,
     borderRadius: 2,
-    backgroundColor: 'rgba(255,255,255,0.2)',
+    backgroundColor: 'transparent',
+  },
+  validationBanner: {
+    position: 'absolute',
+    left: 20,
+    right: 20,
+    bottom: Platform.select({ ios: 96, default: 88 }),
+    backgroundColor: ACCENT,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 999,
+    alignItems: 'center',
+    zIndex: 50,
+    elevation: 30,
+  },
+  validationBannerText: {
+    color: '#0a0a0a',
+    fontSize: 14,
+    fontWeight: '800',
   },
   closeBtn: { position: 'absolute', right: 8, top: 4, padding: 4, zIndex: 3 },
   logoHeaderWrap: {

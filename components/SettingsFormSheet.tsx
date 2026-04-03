@@ -82,7 +82,7 @@ const styles = StyleSheet.create({
     width: 40,
     height: 4,
     borderRadius: 2,
-    backgroundColor: 'rgba(255,255,255,0.2)',
+    backgroundColor: 'transparent',
   },
   closeBtn: { position: 'absolute', right: 0, top: -4, padding: 4 },
   logoHeaderWrap: { alignItems: 'center', marginBottom: 8 },

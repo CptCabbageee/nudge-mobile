@@ -205,7 +205,7 @@ export default function AuthScreen() {
 
   return (
     <AppTiledBackground>
-      <KeyboardAvoidingView style={styles.root} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      <KeyboardAvoidingView style={styles.root} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <View style={styles.content}>
           <Text style={styles.title}>Nudge</Text>
           <Text style={styles.sub}>{isSignUp ? 'Create your account' : 'Sign in to continue'}</Text>

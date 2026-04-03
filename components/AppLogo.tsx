@@ -1,7 +1,7 @@
 import { Image, View } from 'react-native'
 
 type AppLogoProps = {
-  size?: 60 | 120
+  size?: number
 }
 
 export function AppLogo({ size = 120 }: AppLogoProps) {
