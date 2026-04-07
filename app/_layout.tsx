@@ -1,4 +1,5 @@
 import { Stack } from 'expo-router'
+import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { SafeAreaProvider } from 'react-native-safe-area-context'
 import { AppErrorBoundary } from '../components/AppErrorBoundary'
 import { AuthProvider } from '../context/AuthContext'
@@ -6,6 +7,7 @@ import { LeavingHomePromptProvider } from '../context/LeavingHomePromptContext'
 
 export default function RootLayout() {
   return (
+    <GestureHandlerRootView style={{ flex: 1 }}>
     <AppErrorBoundary>
       <SafeAreaProvider>
         <AuthProvider>
@@ -19,5 +21,6 @@ export default function RootLayout() {
         </AuthProvider>
       </SafeAreaProvider>
     </AppErrorBoundary>
+    </GestureHandlerRootView>
   )
 }

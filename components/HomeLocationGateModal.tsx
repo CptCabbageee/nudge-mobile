@@ -68,12 +68,25 @@ export function HomeLocationGateModal({
   const secondaryLabel = isEdit ? 'Cancel' : 'Not now'
   const saveLabel = isEdit ? 'Save changes' : 'Save home'
 
+  const dismiss = () => {
+    if (!saving) onDismissSecondary()
+  }
+
   return (
-    <Modal visible={visible} animationType="fade" transparent onRequestClose={onDismissSecondary}>
-      <View style={{ flex: 1, backgroundColor: 'transparent' }}>
-        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-          <View style={styles.overlay}>
-            <View style={styles.card}>
+    <Modal visible={visible} animationType="fade" transparent onRequestClose={dismiss}>
+      <View style={styles.modalRoot}>
+        <Pressable
+          style={[StyleSheet.absoluteFillObject, styles.backdropDim]}
+          onPress={dismiss}
+          accessibilityLabel="Dismiss home setup"
+          accessibilityRole="button"
+        />
+        <KeyboardAvoidingView
+          style={styles.kav}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          pointerEvents="box-none"
+        >
+          <View style={styles.card} pointerEvents="auto">
               <ScrollView
                 keyboardShouldPersistTaps="handled"
                 showsVerticalScrollIndicator={false}
@@ -145,7 +158,7 @@ export function HomeLocationGateModal({
                 ) : null}
 
                 <View style={styles.actions}>
-                  <Pressable style={styles.skipBtn} onPress={onDismissSecondary} disabled={saving}>
+                  <Pressable style={styles.skipBtn} onPress={dismiss} disabled={saving}>
                     <Text style={styles.skipText}>{secondaryLabel}</Text>
                   </Pressable>
                   <Pressable
@@ -161,7 +174,6 @@ export function HomeLocationGateModal({
                   </Pressable>
                 </View>
               </ScrollView>
-            </View>
           </View>
         </KeyboardAvoidingView>
       </View>
@@ -170,9 +182,14 @@ export function HomeLocationGateModal({
 }
 
 const styles = StyleSheet.create({
-  overlay: {
+  modalRoot: {
     flex: 1,
+  },
+  backdropDim: {
     backgroundColor: 'rgba(0,0,0,0.72)',
+  },
+  kav: {
+    flex: 1,
     justifyContent: 'center',
     padding: 20,
   },

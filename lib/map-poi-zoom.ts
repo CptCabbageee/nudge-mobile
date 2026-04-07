@@ -1,17 +1,21 @@
-import type { Region } from 'react-native-maps'
+type Region = { latitude: number; longitude: number; latitudeDelta: number; longitudeDelta: number }
 
 /**
- * POI markers are hidden when the visible span is larger than this (zoomed out),
- * to avoid clutter. Smaller `latitudeDelta` = more zoomed in.
- * ~0.017° latitude ≈ 1.9 km — roughly “neighbourhood” level and above.
+ * POI fetch + pins are skipped when span is larger than this. 0.22 was too tight — a normal
+ * “county” view (~0.25–0.45°) never fetched OSM POIs, so the map looked empty of place pins.
  */
-export const POI_MARKERS_MAX_LATITUDE_DELTA = 0.08
+export const POI_MARKERS_MAX_LATITUDE_DELTA = 0.55
 
 /** Use the larger of lat/lng delta so wide aspect ratios still require zoom-in. */
 export function regionShowsPoiMarkers(region: Region | null | undefined): boolean {
   if (!region) return false
   const span = Math.max(region.latitudeDelta, region.longitudeDelta)
   return span < POI_MARKERS_MAX_LATITUDE_DELTA
+}
+
+/** Same rule as {@link regionShowsPoiMarkers} using a precomputed span (e.g. from `mapSpanForClustering`). */
+export function spanShowsPoiMarkers(spanDeg: number): boolean {
+  return Number.isFinite(spanDeg) && spanDeg < POI_MARKERS_MAX_LATITUDE_DELTA
 }
 
 /** Finite WGS84 point suitable for geo API requests. */

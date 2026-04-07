@@ -1,7 +1,21 @@
 import type { MapPoi } from './poi-fetch'
 
-/** Cluster radius: POIs within this distance merge into one pill (all categories). */
-const CLUSTER_RADIUS_METERS = 180
+/** Close zoom: POIs within this distance (m) merge into one pill (shared with nudge clustering). */
+export const POI_CLUSTER_RADIUS_METERS_NEAR = 15
+
+/** Far zoom (before merge-all): upper cap for interpolated radius (m). Shared with nudge clustering. */
+export const POI_CLUSTER_RADIUS_METERS_FAR_CAP = 7800
+
+/**
+ * Above this span, all POIs merge into one centroid pill. 0.028 was too aggressive; 0.16 was still
+ * too low — typical “county” views (~0.15–0.22°) became one huge cluster (one glitched marker on Android).
+ */
+export const POI_CLUSTER_MERGE_ALL_SPAN_DEG = 0.14
+
+/** Lerp cap for geographic cluster radius — independent of merge-all threshold. */
+export const POI_CLUSTER_RADIUS_LERP_MAX_SPAN = 0.07
+
+const SPAN_FOR_RADIUS_LERP = { min: 0.002, max: POI_CLUSTER_RADIUS_LERP_MAX_SPAN }
 
 export type PoiClusterRenderItem =
   | { kind: 'single'; key: string; poi: MapPoi }
@@ -28,7 +42,7 @@ const MAX_CATEGORY_ICONS = 3
 export type CategoryCountRow = { category: string; count: number }
 
 /** Categories in a cluster sorted by count descending (for pill icons). */
-export function getClusterCategoryRows(members: MapPoi[]): CategoryCountRow[] {
+export function getClusterCategoryRowsFromMembers(members: { category: string | null }[]): CategoryCountRow[] {
   const m = new Map<string, number>()
   for (const p of members) {
     const c = (p.category ?? '').trim() || '⭐'
@@ -37,6 +51,10 @@ export function getClusterCategoryRows(members: MapPoi[]): CategoryCountRow[] {
   return [...m.entries()]
     .map(([category, count]) => ({ category, count }))
     .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category))
+}
+
+export function getClusterCategoryRows(members: MapPoi[]): CategoryCountRow[] {
+  return getClusterCategoryRowsFromMembers(members)
 }
 
 /** First {@link MAX_CATEGORY_ICONS} category rows and how many additional category types exist. */
@@ -50,7 +68,19 @@ export function getClusterPillCategories(rows: CategoryCountRow[]): {
   }
 }
 
-function floodFillGeographic(pois: MapPoi[], startGlobal: number, assigned: Set<number>): MapPoi[] {
+function clusterRadiusMetersForSpan(mapSpanDeg: number): number {
+  const { min, max } = SPAN_FOR_RADIUS_LERP
+  if (mapSpanDeg <= min) return POI_CLUSTER_RADIUS_METERS_NEAR
+  const t = Math.max(0, Math.min(1, (mapSpanDeg - min) / (max - min)))
+  return POI_CLUSTER_RADIUS_METERS_NEAR + t * (POI_CLUSTER_RADIUS_METERS_FAR_CAP - POI_CLUSTER_RADIUS_METERS_NEAR)
+}
+
+function floodFillGeographic(
+  pois: MapPoi[],
+  startGlobal: number,
+  assigned: Set<number>,
+  clusterRadiusMeters: number,
+): MapPoi[] {
   const members: MapPoi[] = []
   const stack: number[] = [startGlobal]
   assigned.add(startGlobal)
@@ -64,7 +94,7 @@ function floodFillGeographic(pois: MapPoi[], startGlobal: number, assigned: Set<
       if (assigned.has(j)) continue
       const pj = pois[j]
       if (
-        haversineMeters({ lat: pi.lat, lng: pi.lng }, { lat: pj.lat, lng: pj.lng }) <= CLUSTER_RADIUS_METERS
+        haversineMeters({ lat: pi.lat, lng: pi.lng }, { lat: pj.lat, lng: pj.lng }) <= clusterRadiusMeters
       ) {
         assigned.add(j)
         stack.push(j)
@@ -75,20 +105,39 @@ function floodFillGeographic(pois: MapPoi[], startGlobal: number, assigned: Set<
   return members
 }
 
+function oneClusterForAllMembers(members: MapPoi[]): PoiClusterRenderItem {
+  const centerLat = members.reduce((s, m) => s + m.lat, 0) / members.length
+  const centerLng = members.reduce((s, m) => s + m.lng, 0) / members.length
+  const key = `cl-all-${members
+    .map((m) => m.key)
+    .sort()
+    .join('|')}`
+  return { kind: 'cluster', key, members, centerLat, centerLng }
+}
+
 /**
- * Geographic clustering: POIs within {@link CLUSTER_RADIUS_METERS} merge into one pill (any mix of categories).
+ * Geographic clustering: POIs within the radius implied by `mapSpanDeg` merge into pills. When the
+ * map is zoomed out ({@link POI_CLUSTER_MERGE_ALL_SPAN_DEG}), all POIs become a single cluster.
  */
-export function clusterMapPois(pois: MapPoi[]): PoiClusterRenderItem[] {
+export function clusterMapPois(pois: MapPoi[], mapSpanDeg: number): PoiClusterRenderItem[] {
   if (pois.length === 0) {
     return []
   }
 
+  if (mapSpanDeg >= POI_CLUSTER_MERGE_ALL_SPAN_DEG) {
+    if (pois.length === 1) {
+      return [{ kind: 'single', key: pois[0].key, poi: pois[0] }]
+    }
+    return [oneClusterForAllMembers(pois)]
+  }
+
+  const clusterRadiusMeters = clusterRadiusMetersForSpan(mapSpanDeg)
   const assigned = new Set<number>()
   const out: PoiClusterRenderItem[] = []
 
   for (let i = 0; i < pois.length; i++) {
     if (assigned.has(i)) continue
-    const members = floodFillGeographic(pois, i, assigned)
+    const members = floodFillGeographic(pois, i, assigned, clusterRadiusMeters)
 
     if (members.length === 1) {
       out.push({ kind: 'single', key: members[0].key, poi: members[0] })

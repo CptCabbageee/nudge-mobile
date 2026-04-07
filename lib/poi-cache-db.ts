@@ -18,6 +18,9 @@ function getDb(): Promise<SQLiteDatabase> {
         );
       `)
       return db
+    }).catch((e) => {
+      dbReady = null
+      throw e
     })
   }
   return dbReady

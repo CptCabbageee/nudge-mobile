@@ -11,13 +11,14 @@ export function AppLogo({ size = 120 }: AppLogoProps) {
         width: size,
         height: size,
         backgroundColor: 'transparent',
-        overflow: 'hidden',
         borderRadius: size / 2,
+        alignItems: 'center',
+        justifyContent: 'center',
       }}
     >
       <Image
         source={require('../assets/images/logo.png')}
-        style={{ width: size, height: size, backgroundColor: 'transparent' }}
+        style={{ width: size * 0.85, height: size * 0.85, backgroundColor: 'transparent' }}
         resizeMode="contain"
       />
     </View>

@@ -8,8 +8,10 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
+  Dimensions,
   InteractionManager,
   Keyboard,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -17,21 +19,30 @@ import {
   Text,
   View,
 } from 'react-native'
-import MapView, { Circle, Marker, UrlTile, type MapPressEvent, type Region } from 'react-native-maps'
+import {
+  Map as MapLibreMap,
+  Camera,
+  type CameraRef,
+  type MapRef,
+  GeoJSONSource,
+  Layer,
+  Marker,
+} from '@maplibre/maplibre-react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { HomeLocationGateModal, type HomeDraft } from '../../components/HomeLocationGateModal'
 import { GooglePlacesAddressSearchField } from '../../components/GooglePlacesAddressSearchField'
-import { AppTiledBackground } from '../../components/AppTiledBackground'
 import { AppStartupSplash } from '../../components/AppStartupSplash'
 import NudgeModal, { type NudgeSavePayload } from '../../components/NudgeModal'
 import { NudgeToast } from '../../components/NudgeToast'
+import { AppLogo } from '../../components/AppLogo'
 import { CategoryIcon } from '../../components/CategoryIcon'
 import { useAuth } from '../../context/AuthContext'
 import { useLeavingHomePrompt } from '../../context/LeavingHomePromptContext'
 import { CATEGORIES, CATEGORY_LABELS } from '../../lib/categories'
 import { distanceMetres } from '../../lib/geo'
 import { fetchUserHome, upsertUserHome, type UserHomeRow } from '../../lib/home-queries'
-import { isValidMapRegionForFetch, regionShowsPoiMarkers } from '../../lib/map-poi-zoom'
+import { isValidMapRegionForFetch } from '../../lib/map-poi-zoom'
+import { clusterMapNudges, type NudgeClusterRenderItem } from '../../lib/nudge-cluster'
 import {
   createLeavingHomeNudgeIfAbsent,
   deleteNudgeForUser,
@@ -40,7 +51,7 @@ import {
   updateNudgeForUser,
   type NudgeListItem,
 } from '../../lib/nudge-queries'
-import { loadDefaultRadiusMeters, loadMapStylePreference, saveMapStylePreference } from '../../lib/user-preferences'
+import { loadDefaultRadiusMeters } from '../../lib/user-preferences'
 import {
   clearAllPoiAreaCache,
   peekPoiAreaCache,
@@ -48,7 +59,13 @@ import {
   putPoiAreaCache,
   touchAndReadPoiAreaCache,
 } from '../../lib/poi-cache-db'
-import { clusterMapPois, getClusterCategoryRows, getClusterPillCategories } from '../../lib/poi-cluster'
+import {
+  clusterMapPois,
+  getClusterCategoryRows,
+  getClusterCategoryRowsFromMembers,
+  getClusterPillCategories,
+  type PoiClusterRenderItem,
+} from '../../lib/poi-cluster'
 import {
   fetchNearbyPoisSequential,
   filterPoisAwayFromNudges,
@@ -58,11 +75,20 @@ import {
 import { supabase } from '../../lib/supabase'
 import { effectiveUserId } from '../../lib/dev-user'
 
+
+type Region = {
+  latitude: number
+  longitude: number
+  latitudeDelta: number
+  longitudeDelta: number
+}
+
 const BG = '#0a0a0a'
 const SURFACE = '#141414'
 const ACCENT = '#00BFA5'
+/** POI pins / clusters — dark blue, distinct from turquoise nudges. */
+const POI_MAP_BLUE = '#0f2438'
 const MUTED = 'rgba(255,255,255,0.55)'
-const TILE_OSM_FR_HOT = 'https://tile-a.openstreetmap.fr/hot/{z}/{x}/{y}.png'
 
 const MAP_OVERLAY_TEXT_SHADOW = {
   textShadowColor: 'rgba(0,0,0,0.8)',
@@ -70,8 +96,11 @@ const MAP_OVERLAY_TEXT_SHADOW = {
   textShadowRadius: 3,
 }
 
-const LOCATION_TIMEOUT_MS = 10_000
-const FALLBACK_COORDS = { lat: 51.8784, lng: 0.5522 } // Braintree
+const LOCATION_TIMEOUT_MS = 20_000
+const FALLBACK_COORDS = { lat: 51.5074, lng: -0.1278 } // London
+
+const STYLE_LIGHT = 'https://tiles.openfreemap.org/styles/liberty'
+const STYLE_DARK = 'https://tiles.openfreemap.org/styles/fiord'
 
 /** POI refetch only if the map centre has moved this far from {@link lastPoiFetchCenterRef} (onRegionChangeComplete). */
 const POI_FETCH_MIN_MOVE_M = 500
@@ -82,11 +111,6 @@ const MIN_REGION_PUBLISH_MOVE_M = 80
 /** Hide POI pins that fall inside a nudge geofence (+ margin) so one tap target stays the nudge. */
 const POI_HIDE_INSIDE_NUDGE_RADIUS_MARGIN_M = 10
 
-/** POI single markers: use per-marker delayed tracksViewChanges (see MapPoiMarker). */
-const MARKER_TRACKS_POI_CHANGES = false
-/** Default pins / simple markers — avoid unnecessary native view sync. */
-const MARKER_TRACKS_SIMPLE = false
-
 function toRegionFromCoords(coords: { lat: number; lng: number }): Region {
   return {
     latitude: coords.lat,
@@ -94,6 +118,27 @@ function toRegionFromCoords(coords: { lat: number; lng: number }): Region {
     latitudeDelta: 0.015,
     longitudeDelta: 0.015,
   }
+}
+
+/** Approximate conversion from latitudeDelta to MapLibreGL zoom level. */
+function latDeltaToZoom(latitudeDelta: number): number {
+  return Math.log2(360 / latitudeDelta) - 1
+}
+
+/** Create a GeoJSON Polygon Feature approximating a circle in metres. */
+function geoCircleFeature(lat: number, lng: number, radiusMeters: number, steps = 64): any {
+  const earthRadius = 6371000
+  const coords: [number, number][] = []
+  for (let i = 0; i < steps; i++) {
+    const angle = (i / steps) * 2 * Math.PI
+    const dLat = ((radiusMeters * Math.cos(angle)) / earthRadius) * (180 / Math.PI)
+    const dLng =
+      ((radiusMeters * Math.sin(angle)) / (earthRadius * Math.cos((lat * Math.PI) / 180))) *
+      (180 / Math.PI)
+    coords.push([lng + dLng, lat + dLat])
+  }
+  coords.push(coords[0])
+  return { type: 'Feature', geometry: { type: 'Polygon', coordinates: [coords] }, properties: {} }
 }
 
 async function getCurrentPositionWithTimeout(timeoutMs: number): Promise<Location.LocationObject | null> {
@@ -111,117 +156,68 @@ async function getCurrentPositionWithTimeout(timeoutMs: number): Promise<Locatio
   }
 }
 
-const nudgePinMarkerStyle = {
-  width: 36,
-  height: 36,
-  borderRadius: 18,
-  alignItems: 'center' as const,
-  justifyContent: 'center' as const,
-  backgroundColor: ACCENT,
-  borderWidth: 2,
-  borderColor: '#0a0a0a',
-  margin: 2,
-}
-
-function PoiClusterPill({ members }: { members: MapPoi[] }) {
-  const rows = getClusterCategoryRows(members)
-  const { top, moreCategoryTypes } = getClusterPillCategories(rows)
-  const distinctCategories = rows.length
-  const n = members.length
-  const showTotalBadge = n > 1 && (distinctCategories > 1 || moreCategoryTypes > 0)
-
-  return (
-    <View style={styles.clusterPill}>
-      {top.map((row, idx) => (
-        <View key={`${row.category}-${idx}`} style={styles.clusterPillIconSlot}>
-          <CategoryIcon category={row.category} size={13} color="#fff" />
-          {row.count > 1 ? <Text style={styles.clusterPillTypeCount}>{row.count}</Text> : null}
-        </View>
-      ))}
-      {moreCategoryTypes > 0 ? (
-        <Text style={styles.clusterPillOverflow}>+{moreCategoryTypes}</Text>
-      ) : null}
-      {showTotalBadge ? <Text style={styles.clusterPillCount}>{n}</Text> : null}
+const MapNudgeMarker = memo(({ nudge, onPress }: { nudge: NudgeListItem; onPress: () => void }) => (
+  <Marker id={nudge.id} lngLat={[nudge.lng, nudge.lat]} onPress={onPress}>
+    <View style={{ width: 80, height: 80, alignItems: 'center', justifyContent: 'center' }} collapsable={false}>
+      <View collapsable={false} style={styles.nudgePin}>
+        <CategoryIcon category={nudge.category || '⭐'} size={18} color={POI_MAP_BLUE} />
+      </View>
     </View>
+  </Marker>
+))
+
+const MapNudgeClusterMarker = memo(({ item, onPress }: { item: Extract<NudgeClusterRenderItem, { kind: 'cluster' }>; onPress: () => void }) => {
+  const rows = getClusterCategoryRowsFromMembers(item.members)
+  const { top } = getClusterPillCategories(rows)
+  return (
+    <Marker id={item.key} lngLat={[item.centerLng, item.centerLat]} onPress={onPress}>
+      <View collapsable={false} style={styles.nudgeClusterMarkerRoot}>
+        <View style={styles.nudgeClusterPill}>
+          <View style={styles.nudgeClusterLogoSlot}><AppLogo size={22} /></View>
+          <View style={styles.nudgeClusterIcons}>
+            {top.map((r) => (
+              <View key={r.category} style={styles.nudgeClusterIconSlot}>
+                <CategoryIcon category={r.category} size={13} color={POI_MAP_BLUE} />
+              </View>
+            ))}
+          </View>
+          <Text style={styles.nudgeClusterCount}>{item.members.length}</Text>
+        </View>
+      </View>
+    </Marker>
   )
-}
+})
 
-const MapNudgeMarker = memo(
-  function MapNudgeMarkerFn({
-    nudge,
-    onPress,
-  }: {
-    nudge: NudgeListItem
-    onPress: (n: NudgeListItem) => void
-  }) {
-    const [tracks, setTracks] = useState(true)
-    useEffect(() => {
-      const t = setTimeout(() => setTracks(false), 500)
-      return () => clearTimeout(t)
-    }, [])
-    return (
-      <Marker
-        coordinate={{ latitude: nudge.lat, longitude: nudge.lng }}
-        tracksViewChanges={tracks}
-        onPress={() => onPress(nudge)}
-      >
-        <View style={[nudgePinMarkerStyle, { overflow: 'visible' }]} collapsable={false}>
-          <CategoryIcon category={nudge.category} size={16} color="#0a0a0a" />
+const MapPoiMarker = memo(({ poi, onPress }: { poi: MapPoi; onPress: () => void }) => (
+  <Marker id={poi.key} lngLat={[poi.lng, poi.lat]} onPress={onPress}>
+    <View style={{ width: 80, height: 80, alignItems: 'center', justifyContent: 'center' }} collapsable={false}>
+      <View collapsable={false} style={styles.poiPin}>
+        <CategoryIcon category={poi.category} size={17} color={ACCENT} />
+      </View>
+    </View>
+  </Marker>
+))
+
+const MapClusterMarker = memo(({ item, onPress }: { item: Extract<PoiClusterRenderItem, { kind: 'cluster' }>; onPress: () => void }) => {
+  const rows = getClusterCategoryRows(item.members)
+  const { top } = getClusterPillCategories(rows)
+  return (
+    <Marker id={item.key} lngLat={[item.centerLng, item.centerLat]} onPress={onPress}>
+      <View collapsable={false} style={styles.poiClusterMarkerRoot}>
+        <View style={styles.poiClusterPill}>
+          <View style={styles.poiClusterIcons}>
+            {top.map((r) => (
+              <View key={r.category} style={styles.poiClusterIconSlot}>
+                <CategoryIcon category={r.category} size={13} color={ACCENT} />
+              </View>
+            ))}
+          </View>
+          <Text style={styles.poiClusterCount}>{item.members.length}</Text>
         </View>
-      </Marker>
-    )
-  },
-  (a, b) =>
-    a.nudge.id === b.nudge.id &&
-    a.nudge.lat === b.nudge.lat &&
-    a.nudge.lng === b.nudge.lng &&
-    a.nudge.category === b.nudge.category &&
-    a.nudge.title === b.nudge.title &&
-    (a.nudge.notes ?? '') === (b.nudge.notes ?? '') &&
-    a.nudge.location_name === b.nudge.location_name &&
-    a.nudge.trigger === b.nudge.trigger &&
-    a.nudge.radius_meters === b.nudge.radius_meters &&
-    a.onPress === b.onPress,
-)
-
-const poiPinStyle = {
-  width: 24,
-  height: 24,
-  borderRadius: 12,
-  alignItems: 'center' as const,
-  justifyContent: 'center' as const,
-  backgroundColor: 'rgba(20,20,20,0.95)',
-  borderWidth: 1,
-  borderColor: 'rgba(0,191,165,0.6)',
-}
-
-const MapPoiMarker = memo(
-  function MapPoiMarkerFn({
-    item,
-    onPress,
-  }: {
-    item: { key: string; poi: MapPoi }
-    onPress: (item: { key: string; poi: MapPoi }) => void
-  }) {
-    const [tracks, setTracks] = useState(true)
-    useEffect(() => {
-      const t = setTimeout(() => setTracks(false), 500)
-      return () => clearTimeout(t)
-    }, [])
-    return (
-      <Marker
-        coordinate={{ latitude: item.poi.lat, longitude: item.poi.lng }}
-        tracksViewChanges={tracks}
-        onPress={() => onPress(item)}
-      >
-        <View style={poiPinStyle} collapsable={false}>
-          <CategoryIcon category={item.poi.category} size={14} color={ACCENT} />
-        </View>
-      </Marker>
-    )
-  },
-  (a, b) => a.item.key === b.item.key && a.onPress === b.onPress,
-)
+      </View>
+    </Marker>
+  )
+})
 
 type MapScreenBodyProps = {
   /** Null when auth is bypassed for development. */
@@ -230,6 +226,7 @@ type MapScreenBodyProps = {
   initialRegion: Region
   initialUserCoords: { lat: number; lng: number }
   onRefocusRequestLocation: () => void
+  openHomeGateOnLoad?: boolean
 }
 
 /** All hooks run unconditionally at the top level; no returns before hooks complete. */
@@ -239,13 +236,18 @@ function MapScreenBody({
   initialRegion,
   initialUserCoords,
   onRefocusRequestLocation,
+  openHomeGateOnLoad,
 }: MapScreenBodyProps) {
   const { registerLeavingHomeComposeHandler, invalidateLeavingHomePromptCheck } = useLeavingHomePrompt()
   const isFocused = useIsFocused()
 
   const [userCoords, setUserCoords] = useState(initialUserCoords)
   const [region, setRegion] = useState<Region>(initialRegion)
-  const [mapStyle, setMapStyle] = useState<'standard' | 'satellite'>('standard')
+  /** Updated on every region change complete (unlike `region` when movement is below publish threshold). */
+  const [mapSpanForClustering, setMapSpanForClustering] = useState(
+    () => Math.max(initialRegion.latitudeDelta, initialRegion.longitudeDelta),
+  )
+  const [isDarkMode, setIsDarkMode] = useState(false)
   const [activeCategories, setActiveCategories] = useState<Set<string>>(new Set(CATEGORIES))
   const [nudges, setNudges] = useState<Awaited<ReturnType<typeof fetchUserNudges>>['data']>([])
   const [homeRow, setHomeRow] = useState<UserHomeRow | null>(null)
@@ -258,10 +260,19 @@ function MapScreenBody({
   const [searchAnchor, setSearchAnchor] = useState<{ lat: number; lng: number } | null>(null)
   const [homeGateOpen, setHomeGateOpen] = useState(false)
   const [homeGateChecked, setHomeGateChecked] = useState(false)
+  const openHomeGateOnLoadFiredRef = useRef(false)
+  useEffect(() => {
+    if (openHomeGateOnLoad && !openHomeGateOnLoadFiredRef.current) {
+      openHomeGateOnLoadFiredRef.current = true
+      setHomeGateOpen(true)
+    }
+  }, [])
   const [homeDraft, setHomeDraft] = useState<HomeDraft | null>(null)
   const [homeMapPickActive, setHomeMapPickActive] = useState(false)
   const [homeSaving, setHomeSaving] = useState(false)
   const [pois, setPois] = useState<MapPoi[]>([])
+  const poisRef = useRef<MapPoi[]>([])
+
   const [poiProgress, setPoiProgress] = useState(0)
   /** True from POI fetch start until batch applied or run ends (covers progress 0 steps). */
   const [poiFetchActive, setPoiFetchActive] = useState(false)
@@ -269,11 +280,16 @@ function MapScreenBody({
   const [hasHomeLeaveNudge, setHasHomeLeaveNudge] = useState(false)
   const [toastMessage, setToastMessage] = useState('')
   const [toastVisible, setToastVisible] = useState(false)
-  const mapRef = useRef<MapView | null>(null)
+
+  const mapRef = useRef<MapRef | null>(null)
+  const cameraRef = useRef<CameraRef | null>(null)
   const poiAbortRef = useRef<AbortController | null>(null)
   const mapInitialRegionRef = useRef<Region | null>(null)
+  const initialCameraSettingsRef = useRef<{ center: [number, number]; zoom: number } | null>(null)
   const homeGateDismissedRef = useRef(false)
+
   const hasDoneInitialPoiFetchRef = useRef(false)
+  const hasLoadedInitialNudgesRef = useRef(false)
   /** Last map centre we used to start a POI fetch (onRegionChangeComplete only). */
   const lastPoiFetchCenterRef = useRef<{ lat: number; lng: number } | null>(null)
   /** Last {@link poiAreaCacheKey} we successfully loaded (cache or network). Used with 500 m guard. */
@@ -297,6 +313,7 @@ function MapScreenBody({
   }, [initialUserCoords])
   useEffect(() => {
     setRegion(initialRegion)
+    setMapSpanForClustering(Math.max(initialRegion.latitudeDelta, initialRegion.longitudeDelta))
   }, [initialRegion])
 
   useEffect(() => {
@@ -312,6 +329,7 @@ function MapScreenBody({
   }, [nudges])
 
   const applyPoisBatch = useCallback((all: MapPoi[]) => {
+    poisRef.current = all
     setPois(all)
     setPoiFetchActive(false)
   }, [])
@@ -334,16 +352,16 @@ function MapScreenBody({
   }, [])
 
   const refreshAll = useCallback(async () => {
-    // TODO: remove this after one run
-    await clearAllPoiAreaCache().catch(() => {})
     const uid = effectiveUserId(user?.id)
-    const [nRes, hRes, defaultRadius, style] = await Promise.all([
+    const [nRes, hRes, defaultRadius] = await Promise.all([
       fetchUserNudges(uid),
       fetchUserHome(uid),
       loadDefaultRadiusMeters(),
-      loadMapStylePreference(),
     ])
-    if (!nRes.error) setNudges(nRes.data)
+    if (!nRes.error) {
+      setNudges(nRes.data)
+      hasLoadedInitialNudgesRef.current = true
+    }
     if (!hRes.error) setHomeRow(hRes.data)
     if (!hRes.error && hRes.data?.id) {
       const leaveExists = await hasLeavingHomeNudge(uid, hRes.data.id)
@@ -352,7 +370,6 @@ function MapScreenBody({
       setHasHomeLeaveNudge(false)
     }
     setRadiusMeters(defaultRadius)
-    setMapStyle(style)
     setHomeGateChecked(true)
   // eslint-disable-next-line react-hooks/exhaustive-deps -- effectiveUserId(user?.id) read fresh each call
   }, [])
@@ -408,19 +425,10 @@ function MapScreenBody({
   const maybeFetchPoisForRegion = useCallback(
     (r: Region, opts?: { force?: boolean }) => {
       void (async () => {
+        if (Math.max(r.latitudeDelta, r.longitudeDelta) < 0.001) return
         if (!isValidMapRegionForFetch(r)) return
 
-        if (!regionShowsPoiMarkers(r)) {
-          poiAbortRef.current?.abort()
-          poiAbortRef.current = null
-          setPoiFetchActive(false)
-          setPois([])
-          setPoiProgress(0)
-          lastPoiFetchCenterRef.current = null
-          lastPoiFetchAreaKeyRef.current = null
-          return
-        }
-
+        /* Always fetch when the region is valid — zoom-based gating left too many views with zero POIs (Nominatim viewbox is fixed-size anyway). */
         const center = { lat: r.latitude, lng: r.longitude }
         const areaKey = poiAreaCacheKey(center.lat, center.lng)
         const prevCenter = lastPoiFetchCenterRef.current
@@ -428,12 +436,29 @@ function MapScreenBody({
         const sameAreaBucket =
           lastPoiFetchAreaKeyRef.current != null && lastPoiFetchAreaKeyRef.current === areaKey
 
-        /* Only skip when still in same 2dp tile *and* centre barely moved — otherwise refresh/cache new tile. */
-        if (!opts?.force && prevCenter != null && movedM != null && movedM < POI_FETCH_MIN_MOVE_M && sameAreaBucket) {
+        const isNeighbourOfLastArea = (() => {
+          const lastKey = lastPoiFetchAreaKeyRef.current
+          if (!lastKey) return false
+          for (const dLat of [-0.01, 0, 0.01]) {
+            for (const dLng of [-0.01, 0, 0.01]) {
+              if (dLat === 0 && dLng === 0) continue
+              if (poiAreaCacheKey(center.lat + dLat, center.lng + dLng) === lastKey) return true
+            }
+          }
+          return false
+        })()
+
+        /* Only skip when still in same or adjacent 2dp tile *and* centre barely moved. */
+        if (!opts?.force && prevCenter != null && movedM != null && movedM < POI_FETCH_MIN_MOVE_M && (sameAreaBucket || isNeighbourOfLastArea)) {
           console.log('[POI] skip (same cache bucket, moved < 500m)', {
             areaKey,
             movedM: Math.round(movedM),
           })
+          /* No in-flight request: clear any stale loading UI (e.g. interrupted run). */
+          if (poiAbortRef.current == null) {
+            setPoiFetchActive(false)
+            setPoiProgress(0)
+          }
           return
         }
 
@@ -464,6 +489,27 @@ function MapScreenBody({
             console.log('[POI fetch] NETWORK silent refresh', { areaKey })
           }
 
+          const finalize = (_la: number, _ln: number, accumulated: MapPoi[]) => {
+            const filtered = filterPoisAwayFromNudges(accumulated, nudgeCoords)
+            if (!silent) {
+              setPoiProgress(1)
+              /* Empty finalize must not wipe markers (timeouts / partial batches). */
+              if (filtered.length > 0) {
+                applyPoisBatch(filtered)
+                lastPoiFetchAreaKeyRef.current = areaKey
+                void putPoiAreaCache(areaKey, filtered)
+              } else {
+                setPoiFetchActive(false)
+              }
+            } else if (filtered.length > 0) {
+              /* Silent refresh: never clear POIs with [] — only update when we got hits. */
+              poisRef.current = filtered
+              setPois(filtered)
+              lastPoiFetchAreaKeyRef.current = areaKey
+              void putPoiAreaCache(areaKey, filtered)
+            }
+          }
+
           return fetchNearbyPoisSequential(
             center.lat,
             center.lng,
@@ -474,6 +520,7 @@ function MapScreenBody({
               const filtered = filterPoisAwayFromNudges(batch, nudgeCoords)
               if (filtered.length > 0) {
                 if (silent) {
+                  poisRef.current = filtered
                   setPois(filtered)
                 } else {
                   applyPoisBatch(filtered)
@@ -482,7 +529,7 @@ function MapScreenBody({
                 void putPoiAreaCache(areaKey, filtered)
               }
             },
-            silent ? undefined : () => setPoiProgress(1),
+            finalize,
             perQueryLimit,
           )
         }
@@ -493,10 +540,12 @@ function MapScreenBody({
             if (cachedRow) {
               const filtered = filterPoisAwayFromNudges(cachedRow.pois, nudgeCoords)
               if (filtered.length === 0) {
-                lastPoiFetchCenterRef.current = null
-                lastPoiFetchAreaKeyRef.current = null
+                // Cache hit but all POIs filtered out — still a hit, skip network fetch
+                lastPoiFetchAreaKeyRef.current = areaKey
+                return
               } else {
                 console.log('[POI cache] HIT', { areaKey, poiCount: filtered.length })
+                poisRef.current = filtered
                 setPois(filtered)
                 setPoiFetchActive(false)
                 setPoiProgress(1)
@@ -525,8 +574,9 @@ function MapScreenBody({
   /** Refetch POIs when nudges change (near-nudge filtering). Skipped when zoomed out. */
   useEffect(() => {
     const timer = setTimeout(() => {
+      if (!hasLoadedInitialNudgesRef.current) return
       const r = stableMapRegionRef.current
-      if (!r || !isValidMapRegionForFetch(r) || !regionShowsPoiMarkers(r)) return
+      if (!r || !isValidMapRegionForFetch(r)) return
       lastPoiFetchCenterRef.current = null
       lastPoiFetchAreaKeyRef.current = null
       maybeFetchPoisForRegion(r, { force: true })
@@ -536,11 +586,21 @@ function MapScreenBody({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nudges])
 
+  /** Refetch POIs when map style changes (dark/light mode toggle). */
+  useEffect(() => {
+    const r = stableMapRegionRef.current
+    if (!r || !isValidMapRegionForFetch(r)) return
+    lastPoiFetchCenterRef.current = null
+    lastPoiFetchAreaKeyRef.current = null
+    maybeFetchPoisForRegion(r, { force: true })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDarkMode])
+
   useEffect(() => {
     if (!isFocused) return
     if (hasDoneInitialPoiFetchRef.current) return
     const r = stableMapRegionRef.current ?? initialRegion
-    if (!isValidMapRegionForFetch(r) || !regionShowsPoiMarkers(r)) return
+    if (!isValidMapRegionForFetch(r)) return
     hasDoneInitialPoiFetchRef.current = true
     maybeFetchPoisForRegion(r)
   // eslint-disable-next-line react-hooks/exhaustive-deps -- initial POI once per focus; stable maybeFetchPoisForRegion
@@ -581,7 +641,10 @@ function MapScreenBody({
               void putPoiAreaCache(areaKey, filtered)
             }
           },
-          undefined,
+          (_la, _ln, accumulated) => {
+            const filtered = filterPoisAwayFromNudges(accumulated, nudgeCoords)
+            if (filtered.length > 0) void putPoiAreaCache(areaKey, filtered)
+          },
           50,
         )
         if (!cancelled) console.log('[POI prefetch home] done', { areaKey })
@@ -608,6 +671,19 @@ function MapScreenBody({
     [nudges, activeCategories],
   )
 
+  const spanSafeForClustering = useMemo(() => {
+    const s = mapSpanForClustering
+    if (!Number.isFinite(s) || s <= 0) {
+      return Math.max(initialRegion.latitudeDelta, initialRegion.longitudeDelta)
+    }
+    return s
+  }, [mapSpanForClustering, initialRegion.latitudeDelta, initialRegion.longitudeDelta])
+
+  const clusteredNudges = useMemo(
+    () => clusterMapNudges(nudgesOnMap, spanSafeForClustering),
+    [nudgesOnMap, spanSafeForClustering],
+  )
+
   const filteredPois = useMemo(() => {
     let list = pois.filter((p) => activeCategories.has(p.category))
     if (nudgesOnMap.length === 0) return list
@@ -624,7 +700,10 @@ function MapScreenBody({
     return list
   }, [pois, activeCategories, nudgesOnMap])
 
-  const clusteredPois = useMemo(() => clusterMapPois(filteredPois), [filteredPois])
+  const clusteredPois = useMemo(
+    () => clusterMapPois(filteredPois, spanSafeForClustering),
+    [filteredPois, spanSafeForClustering],
+  )
 
   const allFiltersActive = useMemo(() => CATEGORIES.every((c) => activeCategories.has(c)), [activeCategories])
 
@@ -636,43 +715,95 @@ function MapScreenBody({
     })
   }, [])
 
-  const onNudgeMarkerPress = useCallback((n: NudgeListItem) => {
-    setNudgeEditPrompt(n)
-  }, [])
+  const locateUser = async () => {
+    let { status } = await Location.getForegroundPermissionsAsync().catch(() => ({ status: 'denied' as const }))
+    if (status !== 'granted') {
+      const req = await Location.requestForegroundPermissionsAsync().catch(() => ({ status: 'denied' as const }))
+      status = req.status
+    }
+    if (status !== 'granted') {
+      Alert.alert('Location unavailable', 'Please grant location access in Settings.')
+      return
+    }
+    const pos = await Promise.race([
+      Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+    ]).catch(() => null)
+    if (pos && pos.coords && Number.isFinite(pos.coords.latitude) && Number.isFinite(pos.coords.longitude)) {
+      const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude }
+      void cameraRef.current?.flyTo([coords.lng, coords.lat], 300)
+      setIsMapCenteredOnUser(true)
+    } else {
+      Alert.alert('Location unavailable', 'Couldn\'t get your current location.')
+    }
+  }
 
   const handleMapPress = useCallback(
-    (e: MapPressEvent) => {
+    async (e: any) => {
+      const lngLat = e?.nativeEvent?.lngLat as [number, number] | undefined
+      if (!lngLat || !Number.isFinite(lngLat[0]) || !Number.isFinite(lngLat[1])) return
+      const longitude = lngLat[0]
+      const latitude = lngLat[1]
       Keyboard.dismiss()
-      const c = e.nativeEvent.coordinate
-      if (!c || !Number.isFinite(c.latitude) || !Number.isFinite(c.longitude)) return
+      if (mapRef.current) {
+        try {
+          const tapPt = await mapRef.current.project([longitude, latitude])
+          if (tapPt) {
+            const clusters = ([...clusteredPois, ...clusteredNudges] as Array<{ kind: string; centerLng: number; centerLat: number }>)
+              .filter(i => i.kind === 'cluster')
+            for (const cluster of clusters) {
+              const pt = await mapRef.current?.project([cluster.centerLng, cluster.centerLat])
+              if (pt) {
+                const dx = pt[0] - tapPt[0]
+                const dy = pt[1] - tapPt[1]
+                if (Math.sqrt(dx * dx + dy * dy) < 40) return
+              }
+            }
+          }
+        } catch { /* skip guard on error */ }
+      }
       if (homeMapPickActive) {
         setHomeDraft((prev) => ({
-          lat: c.latitude,
-          lng: c.longitude,
+          lat: latitude,
+          lng: longitude,
           name: prev?.name?.trim() || 'Home',
         }))
         setHomeMapPickActive(false)
         return
       }
+      const nearbyNudge = nudgesOnMap.find(
+        (n) => distanceMetres({ lat: latitude, lng: longitude }, { lat: n.lat, lng: n.lng }) <= 30,
+      )
+      if (nearbyNudge) {
+        setNudgeEditPrompt(nearbyNudge)
+        return
+      }
+      const nearCluster = ([...clusteredPois, ...clusteredNudges] as Array<{ kind: string; centerLat: number; centerLng: number }>)
+        .filter(i => i.kind === 'cluster')
+        .some(i => distanceMetres({ lat: latitude, lng: longitude }, { lat: i.centerLat, lng: i.centerLng }) <= 200)
+      if (nearCluster) return
       setNudgeEditPrompt(null)
       setSearchAnchor(null)
-      setTapDraft({ lat: c.latitude, lng: c.longitude, category: '⭐' })
-      mapRef.current?.animateToRegion(
-        {
-          latitude: c.latitude,
-          longitude: c.longitude,
-          latitudeDelta: 0.008,
-          longitudeDelta: 0.008,
-        },
-        280,
-      )
+      setTapDraft({ lat: latitude, lng: longitude, category: '⭐' })
+      void cameraRef.current?.flyTo([longitude, latitude], 280)
     },
-    [homeMapPickActive],
+    [homeMapPickActive, clusteredPois, clusteredNudges, nudgesOnMap],
   )
 
-  const handleRegionChangeComplete = useCallback(
-    (r: Region) => {
+  const handleRegionDidChange = useCallback(
+    (event: any) => {
+      const center = event?.nativeEvent?.center as [number, number] | undefined
+      const bounds = event?.nativeEvent?.bounds as [number, number, number, number] | undefined
+      if (!center || !bounds) return
+      const [west, south, east, north] = bounds
+      const r: Region = {
+        latitude: center[1],
+        longitude: center[0],
+        latitudeDelta: north - south,
+        longitudeDelta: east - west,
+      }
       stableMapRegionRef.current = r
+      setMapSpanForClustering(Math.max(r.latitudeDelta, r.longitudeDelta))
       maybeFetchPoisForRegion(r)
       if (shouldPublishRegionToState(r, regionPublishedRef.current)) {
         regionPublishedRef.current = r
@@ -702,12 +833,13 @@ function MapScreenBody({
         if (up.error) {
           console.warn('[saveNudge] update failed', up.error)
         } else {
-          await refreshAll()
           setNudgeModalOpen(false)
           setEditNudge(null)
           setPendingCreate(null)
           setTapDraft(null)
+          setNudgeEditPrompt(null)
           showToast('Nudge saved!')
+          void refreshAll()
         }
         return
       }
@@ -746,12 +878,13 @@ function MapScreenBody({
         console.warn('[saveNudge] nudges insert failed', ins.error)
         Alert.alert('Save failed', ins.error?.message ?? 'Nudge insert failed')
       } else {
-        await refreshAll()
         setNudgeModalOpen(false)
         setPendingCreate(null)
         setEditNudge(null)
         setTapDraft(null)
+        setNudgeEditPrompt(null)
         showToast('Nudge saved!')
+        void refreshAll()
       }
     },
     [refreshAll, showToast],
@@ -785,6 +918,10 @@ function MapScreenBody({
 
   if (!mapInitialRegionRef.current) {
     mapInitialRegionRef.current = region
+    initialCameraSettingsRef.current = {
+      center: [region.longitude, region.latitude],
+      zoom: latDeltaToZoom(region.latitudeDelta),
+    }
   }
 
   const mapSearchLat = stableMapRegionRef.current?.latitude ?? region.latitude
@@ -883,144 +1020,138 @@ function MapScreenBody({
   ) : null
 
   return (
-    <AppTiledBackground>
-      <View style={styles.root}>
+    <View style={styles.root}>
       <View style={styles.mapShell}>
-        <MapView
+        <MapLibreMap
           ref={mapRef}
           style={styles.map}
-          mapType={mapStyle}
-          mapPadding={{
-            top: 0,
-            right: 0,
-            left: 0,
-            bottom: 80,
-          }}
-          legalLabelInsets={Platform.select({
-            android: { bottom: 60, right: 200, top: 0, left: 0 },
-            ios: { top: insets.top + 64, left: 12, bottom: 0, right: 0 },
-            default: { bottom: 0, left: 0, top: 0, right: 0 },
-          })}
-          toolbarEnabled={false}
-          initialRegion={mapInitialRegionRef.current}
-          onRegionChangeComplete={handleRegionChangeComplete}
+          mapStyle={isDarkMode ? STYLE_DARK : STYLE_LIGHT}
           onPress={handleMapPress}
-          userInterfaceStyle="dark"
+          onRegionDidChange={handleRegionDidChange}
+          onDidFailLoadingMap={(error) => console.error('Map failed to load:', error)}
+          onDidFinishLoadingMap={() => console.log('Map loaded successfully')}
+          onDidFinishLoadingStyle={() => {
+            console.log('Map style loaded successfully')
+            if (poisRef.current.length > 0) {
+              setPois([...poisRef.current])
+            }
+          }}
         >
-        {mapStyle === 'standard' ? <UrlTile urlTemplate={TILE_OSM_FR_HOT} maximumZ={19} flipY={false} /> : null}
-        {nudgesOnMap.map((n) => (
-          <Circle
-            key={`nudge-zone-${n.id}`}
-            center={{ latitude: n.lat, longitude: n.lng }}
-            radius={Math.max(1, Number(n.radius_meters) || 25)}
-            fillColor="rgba(0,191,165,0.15)"
-            strokeColor="rgba(0,191,165,0.8)"
-            strokeWidth={2}
+          <Camera
+            ref={cameraRef}
+            initialViewState={initialCameraSettingsRef.current ?? undefined}
           />
-        ))}
-        {nudgesOnMap.map((n) => (
-          <MapNudgeMarker key={n.id} nudge={n} onPress={onNudgeMarkerPress} />
-        ))}
-        {homeRow ? (
-          <>
-            <Circle
-              center={{ latitude: homeRow.lat, longitude: homeRow.lng }}
-              radius={homeRow.radius_meters}
-              fillColor="rgba(0,191,165,0.10)"
-              strokeColor="rgba(0,191,165,0.8)"
-            />
-            <Marker
-              coordinate={{ latitude: homeRow.lat, longitude: homeRow.lng }}
-              tracksViewChanges={MARKER_TRACKS_SIMPLE}
-              anchor={{ x: 0.5, y: 0.5 }}
-              style={{ zIndex: 10 }}
+          {nudgesOnMap.map((n) => (
+            <GeoJSONSource
+              key={`nudge-zone-${n.id}`}
+              id={`nudge-zone-${n.id}`}
+              data={geoCircleFeature(n.lat, n.lng, Math.max(1, Number(n.radius_meters) || 25))}
             >
-              <View style={styles.homePin} collapsable={false}>
-                <Ionicons name="home" size={14} color="#0a0a0a" />
-              </View>
-            </Marker>
-          </>
-        ) : null}
-        {clusteredPois.map((item) =>
-          item.kind === 'single' ? (
-            <MapPoiMarker
-              key={item.key}
-              item={item}
-              onPress={(poi) => {
-                setNudgeEditPrompt(null)
-                setTapDraft({
-                  lat: poi.poi.lat,
-                  lng: poi.poi.lng,
-                  title: `${poi.poi.label.split(',')[0].trim()} ${poi.poi.displayKey}`,
-                  category: poi.poi.category,
-                })
-                mapRef.current?.animateToRegion(
-                  {
-                    latitude: poi.poi.lat,
-                    longitude: poi.poi.lng,
-                    latitudeDelta: 0.008,
-                    longitudeDelta: 0.008,
-                  },
-                  280,
-                )
-              }}
-            />
-          ) : (
-            <Marker
-              key={item.key}
-              coordinate={{ latitude: item.centerLat, longitude: item.centerLng }}
-              tracksViewChanges={true}
-              onPress={() => {
-                setNudgeEditPrompt(null)
-                const snap = stableMapRegionRef.current
-                const latD = snap?.latitudeDelta ?? mapSpanLatDelta
-                const lngD = snap?.longitudeDelta ?? mapSpanLngDelta
-                mapRef.current?.animateToRegion(
-                  {
-                    latitude: item.centerLat,
-                    longitude: item.centerLng,
-                    latitudeDelta: Math.max(0.0025, latD * 0.5),
-                    longitudeDelta: Math.max(0.0025, lngD * 0.5),
-                  },
-                  260,
-                )
-              }}
-            >
-              <View collapsable={false} style={styles.clusterMarkerWrap}>
-                <PoiClusterPill members={item.members} />
-              </View>
-            </Marker>
-          ),
-        )}
-        {searchAnchor ? (
-          <Marker coordinate={{ latitude: searchAnchor.lat, longitude: searchAnchor.lng }} pinColor="#f59e0b" />
-        ) : null}
-        {tapDraft ? (
-          <>
-            <Circle
-              center={{ latitude: tapDraft.lat, longitude: tapDraft.lng }}
-              radius={radiusMeters}
-              fillColor="rgba(0,191,165,0.18)"
-              strokeColor="rgba(0,191,165,0.95)"
-              strokeWidth={2}
-            />
-            <Marker
-              coordinate={{ latitude: tapDraft.lat, longitude: tapDraft.lng }}
-              tracksViewChanges={MARKER_TRACKS_SIMPLE}
-              anchor={{ x: 0.5, y: 0.5 }}
-            >
-              <View style={styles.tapDraftPin} collapsable={false}>
-                <Ionicons name="add" size={14} color="#fff" />
-              </View>
-            </Marker>
-          </>
-        ) : null}
-        <Marker
-          coordinate={{ latitude: userCoords.lat, longitude: userCoords.lng }}
-          pinColor={ACCENT}
-          tracksViewChanges={MARKER_TRACKS_SIMPLE}
-        />
-      </MapView>
+              <Layer type="fill"
+                id={`nudge-fill-${n.id}`}
+                paint={{ 'fill-color': 'rgba(0,191,165,0.15)' }}
+              />
+              <Layer type="line"
+                id={`nudge-line-${n.id}`}
+                paint={{ 'line-color': POI_MAP_BLUE, 'line-width': 2 }}
+              />
+            </GeoJSONSource>
+          ))}
+          {homeRow ? (
+            <>
+              <GeoJSONSource
+                id="home-zone"
+                data={geoCircleFeature(homeRow.lat, homeRow.lng, homeRow.radius_meters)}
+              >
+                <Layer type="fill"
+                  id="home-fill"
+                  paint={{ 'fill-color': 'rgba(0,191,165,0.10)' }}
+                />
+                <Layer type="line"
+                  id="home-line"
+                  paint={{ 'line-color': 'rgba(0,191,165,0.8)', 'line-width': 1 }}
+                />
+              </GeoJSONSource>
+            </>
+          ) : null}
+          {tapDraft ? (
+            <>
+              <GeoJSONSource
+                id="tap-draft-zone"
+                data={geoCircleFeature(tapDraft.lat, tapDraft.lng, radiusMeters)}
+              >
+                <Layer type="fill"
+                  id="tap-draft-fill"
+                  paint={{ 'fill-color': 'rgba(0,191,165,0.18)' }}
+                />
+                <Layer type="line"
+                  id="tap-draft-line"
+                  paint={{ 'line-color': 'rgba(0,191,165,0.95)', 'line-width': 2 }}
+                />
+              </GeoJSONSource>
+            </>
+          ) : null}
+          {clusteredNudges.map((item) =>
+            item.kind === 'cluster' ? (
+              <MapNudgeClusterMarker
+                key={item.key}
+                item={item}
+                onPress={() => {
+                  void cameraRef.current?.flyTo([item.centerLng, item.centerLat], 400)
+                }}
+              />
+            ) : (
+              <MapNudgeMarker
+                key={item.nudge.id}
+                nudge={item.nudge}
+                onPress={() => setNudgeEditPrompt(item.nudge)}
+              />
+            )
+          )}
+          {clusteredPois.map((item) =>
+            item.kind === 'cluster' ? (
+              <MapClusterMarker
+                key={item.key}
+                item={item}
+                onPress={() => {
+                  console.log('[Cluster tap] members:', item.members.length)
+                  console.log('[Cluster tap] cameraRef:', !!cameraRef.current, typeof cameraRef.current?.flyTo)
+                  setNudgeEditPrompt(null)
+                  if (item.members.length <= 3) {
+                    setTapDraft({
+                      lat: item.centerLat,
+                      lng: item.centerLng,
+                      title: (() => {
+                        const named = item.members
+                          .map(m => m.label.split(',')[0].trim())
+                          .filter((name, i) => name !== item.members[i].category && name !== item.members[i].displayKey)
+                        return named.length > 0 ? named.join(' / ') : (item.members[0]?.category ?? '⭐')
+                      })(),
+                      category: item.members[0]?.category ?? '⭐',
+                    })
+                  } else {
+                    void cameraRef.current?.flyTo([item.centerLng, item.centerLat], 400)
+                  }
+                }}
+              />
+            ) : (
+              <MapPoiMarker
+                key={item.poi.key}
+                poi={item.poi}
+                onPress={() => {
+                  setNudgeEditPrompt(null)
+                  setTapDraft({
+                    lat: item.poi.lat,
+                    lng: item.poi.lng,
+                    title: `${item.poi.label.split(',')[0].trim()} ${item.poi.displayKey}`,
+                    category: item.poi.category,
+                  })
+                  void cameraRef.current?.flyTo([item.poi.lng, item.poi.lat], 400)
+                }}
+              />
+            )
+          )}
+        </MapLibreMap>
       </View>
       <View style={[styles.searchWrap, { top: insets.top + 12 }]} pointerEvents="box-none">
         <View style={styles.searchCard} pointerEvents="auto">
@@ -1044,28 +1175,23 @@ function MapScreenBody({
                 title: (r.display_name || r.name).trim().split(',')[0].trim(),
                 category: '⭐',
               })
-              mapRef.current?.animateToRegion(
-                {
-                  latitude: r.lat,
-                  longitude: r.lng,
-                  latitudeDelta: 0.014,
-                  longitudeDelta: 0.014,
-                },
-                350,
-              )
+              void cameraRef.current?.flyTo([r.lng, r.lat], 400)
+              setTimeout(() => cameraRef.current?.zoomTo(14, 400), 100)
             }}
           />
         </View>
       </View>
 
-      <View
-        style={[styles.bottomFloatingChrome, { bottom: -8, paddingBottom: 6 }]}
-        pointerEvents="box-none"
-      >
+      <View style={styles.bottomFilterSafeArea} pointerEvents="box-none">
         <View style={styles.bottomFloatingColumn} pointerEvents="box-none">
           {showPoiLoadingStrip ? (
             <View style={styles.poiLoadingStackBlock} pointerEvents="none">
-              <Text style={styles.poiLoadingTitle}>Loading nearby places...</Text>
+              <Text
+                style={styles.poiLoadingTitle}
+                {...(Platform.OS === 'android' ? { includeFontPadding: false } : {})}
+              >
+                Loading nearby places...
+              </Text>
               <View style={styles.poiLoadingCard}>
                 <ActivityIndicator color={ACCENT} size="small" />
                 <View style={styles.poiLoadingTrack}>
@@ -1078,6 +1204,16 @@ function MapScreenBody({
             <View style={styles.bottomPromptSlot} pointerEvents="auto">
               {bottomPromptCard}
             </View>
+          ) : null}
+          {!homeRow && homeGateChecked ? (
+            <Pressable
+              pointerEvents="auto"
+              style={styles.addHomeBtn}
+              onPress={() => setHomeGateOpen(true)}
+            >
+              <Ionicons name="home-outline" size={15} color="#0a0a0a" />
+              <Text style={styles.addHomeBtnText}>Add home location</Text>
+            </Pressable>
           ) : null}
           <LinearGradient
             colors={['transparent', 'rgba(10,10,10,0.88)']}
@@ -1130,40 +1266,15 @@ function MapScreenBody({
           isMapCenteredOnUser ? styles.locateBtnOn : styles.locateBtnOff,
           { top: insets.top + 104 },
         ]}
-        onPress={async () => {
-          const pos = await Location.getCurrentPositionAsync({
-            accuracy: Location.Accuracy.Balanced,
-          }).catch(() => null)
-          const coords = pos
-            ? { lat: pos.coords.latitude, lng: pos.coords.longitude }
-            : FALLBACK_COORDS
-          setUserCoords(coords)
-          const next = {
-            latitude: coords.lat,
-            longitude: coords.lng,
-            latitudeDelta: 0.012,
-            longitudeDelta: 0.012,
-          }
-          InteractionManager.runAfterInteractions(() => {
-            requestAnimationFrame(() => {
-              mapRef.current?.animateToRegion(next, 400)
-            })
-          })
-          setIsMapCenteredOnUser(true)
-        }}
+        onPress={() => void locateUser()}
       >
         <Ionicons name="locate" size={16} color={isMapCenteredOnUser ? '#0a0a0a' : '#fff'} />
       </Pressable>
       <Pressable
         style={[styles.mapTypeBtn, { top: insets.top + 56 }]}
-        onPress={() => {
-          const next = mapStyle === 'standard' ? 'satellite' : 'standard'
-          setMapStyle(next)
-          void saveMapStylePreference(next)
-        }}
+        onPress={() => setIsDarkMode((prev) => !prev)}
       >
-        <Ionicons name={mapStyle === 'standard' ? 'layers-outline' : 'map-outline'} size={17} color="#fff" />
-        <Text style={styles.mapTypeBtnText}>{mapStyle === 'standard' ? 'Satellite' : 'Map'}</Text>
+        <Ionicons name={isDarkMode ? 'sunny' : 'moon'} size={17} color="#fff" />
       </Pressable>
 
       <NudgeModal
@@ -1195,7 +1306,8 @@ function MapScreenBody({
         onDraftNameChange={(name) => setHomeDraft((d) => (d ? { ...d, name } : d))}
         onDismissSecondary={() => {
           setHomeGateOpen(false)
-          if (homeRow != null) homeGateDismissedRef.current = true
+          /* Always remember dismiss — without this, no-home + "Not now" re-opens on every refresh. */
+          homeGateDismissedRef.current = true
         }}
         onStartMapPick={() => {
           setHomeMapPickActive(true)
@@ -1257,15 +1369,16 @@ function MapScreenBody({
           <Text style={styles.leaveHomeQuickText}>Add leaving-home nudge</Text>
         </Pressable>
       ) : null}
-      <View pointerEvents="box-none" style={styles.toastHost}>
-        <NudgeToast
-          visible={toastVisible}
-          message={toastMessage}
-          onHide={() => setToastVisible(false)}
-        />
-      </View>
-      </View>
-    </AppTiledBackground>
+      {toastVisible ? (
+        <View pointerEvents="box-none" style={styles.toastHost}>
+          <NudgeToast
+            visible={toastVisible}
+            message={toastMessage}
+            onHide={() => setToastVisible(false)}
+          />
+        </View>
+      ) : null}
+    </View>
   )
 }
 
@@ -1277,32 +1390,70 @@ export default function MapScreen() {
   const [locationBooting, setLocationBooting] = useState(true)
   const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(null)
   const [region, setRegion] = useState<Region | null>(null)
+  const [locationFallbackModalVisible, setLocationFallbackModalVisible] = useState(false)
+  const [openHomeGateOnLoad, setOpenHomeGateOnLoad] = useState(false)
   const hasDoneInitialLocationBootRef = useRef(false)
+  const hasShownLocationFallbackModalRef = useRef(false)
 
   const requestLocation = useCallback(async (opts?: { showSplash?: boolean }) => {
     if (opts?.showSplash) setLocationBooting(true)
-    let resolvedCoords = FALLBACK_COORDS
-    try {
-      const existingPerm = await Location.getForegroundPermissionsAsync().catch(() => null)
-      let status = existingPerm?.status ?? 'undetermined'
-      if (status !== 'granted') {
-        const requested = await Location.requestForegroundPermissionsAsync().catch(() => null)
-        status = requested?.status ?? status
-      }
 
-      if (status === 'granted') {
-        const servicesEnabled = await Location.hasServicesEnabledAsync().catch(() => true)
-        if (servicesEnabled) {
-          const pos = await getCurrentPositionWithTimeout(LOCATION_TIMEOUT_MS)
-          if (pos?.coords && Number.isFinite(pos.coords.latitude) && Number.isFinite(pos.coords.longitude)) {
-            resolvedCoords = { lat: pos.coords.latitude, lng: pos.coords.longitude }
+    let resolvedCoords: { lat: number; lng: number } | null = null
+
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, LOCATION_TIMEOUT_MS)
+
+      void (async () => {
+        try {
+          const existingPerm = await Location.getForegroundPermissionsAsync().catch(() => null)
+          let status = existingPerm?.status ?? 'undetermined'
+          if (status !== 'granted') {
+            const requested = await Location.requestForegroundPermissionsAsync().catch(() => null)
+            status = requested?.status ?? status
           }
+
+          if (status === 'granted') {
+            const servicesEnabled = await Location.hasServicesEnabledAsync().catch(() => true)
+            if (servicesEnabled) {
+              const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced })
+              if (pos?.coords && Number.isFinite(pos.coords.latitude) && Number.isFinite(pos.coords.longitude)) {
+                resolvedCoords = { lat: pos.coords.latitude, lng: pos.coords.longitude }
+              }
+            }
+          }
+        } catch {
+          // fall through; resolvedCoords stays null
+        } finally {
+          if (resolvedCoords !== null) {
+            // Real GPS obtained — dismiss splash early and cancel the timer
+            clearTimeout(timer)
+            resolve()
+          }
+          // No real GPS — let the timer fire naturally after LOCATION_TIMEOUT_MS
         }
-      }
-    } finally {
+      })()
+    })
+
+    if (resolvedCoords !== null) {
       setUserCoords(resolvedCoords)
-      setRegion((prev) => prev ?? toRegionFromCoords(resolvedCoords))
+      setRegion((prev) => prev ?? toRegionFromCoords(resolvedCoords!))
       setLocationBooting(false)
+      setLocationFallbackModalVisible(false)
+    } else {
+      // GPS timed out — check if home row is available to use silently
+      const uid = effectiveUserId(null)
+      const hRes = await fetchUserHome(uid).catch(() => ({ data: null, error: true }))
+      if (!hRes.error && hRes.data) {
+        const homeCoords = { lat: hRes.data.lat, lng: hRes.data.lng }
+        setUserCoords(homeCoords)
+        setRegion((prev) => prev ?? toRegionFromCoords(homeCoords))
+        setLocationBooting(false)
+      } else {
+        // No home row — show modal for user to choose (only once)
+        if (hasShownLocationFallbackModalRef.current) return
+        hasShownLocationFallbackModalRef.current = true
+        setLocationFallbackModalVisible(true)
+      }
     }
   }, [])
 
@@ -1311,27 +1462,110 @@ export default function MapScreen() {
     if (!hasDoneInitialLocationBootRef.current) {
       hasDoneInitialLocationBootRef.current = true
       void requestLocation({ showSplash: true })
-      return
     }
-    void requestLocation({ showSplash: false })
   }, [isFocused, requestLocation])
 
   // TODO: Re-enable auth before launch.
   // if (!user) return <AppStartupSplash message="Loading your account…" />
-  if (locationBooting || !userCoords || !region) return <AppStartupSplash message="Getting your location…" />
 
   return (
-    <MapScreenBody
-      user={user}
-      insets={insets}
-      initialRegion={region}
-      initialUserCoords={userCoords}
-      onRefocusRequestLocation={() => void requestLocation({ showSplash: false })}
-    />
+    <>
+      {locationBooting || !userCoords || !region ? (
+        <AppStartupSplash message="Getting your location…" />
+      ) : (
+        <MapScreenBody
+          user={user}
+          insets={insets}
+          initialRegion={region}
+          initialUserCoords={userCoords}
+          openHomeGateOnLoad={openHomeGateOnLoad}
+          onRefocusRequestLocation={() => void requestLocation({ showSplash: false })}
+        />
+      )}
+      <Modal
+        visible={locationFallbackModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {}}
+      >
+        <Pressable style={styles.locationFallbackOverlay} onPress={() => {
+          setLocationFallbackModalVisible(false)
+          setUserCoords(FALLBACK_COORDS)
+          setRegion((prev) => prev ?? toRegionFromCoords(FALLBACK_COORDS))
+          setLocationBooting(false)
+        }}>
+          <Pressable style={styles.locationFallbackCard} onPress={(e) => e.stopPropagation()}>
+            <Text style={styles.locationFallbackTitle}>Couldn't get your location</Text>
+            <Pressable
+              style={styles.locationFallbackBtn}
+              onPress={() => {
+                setUserCoords(FALLBACK_COORDS)
+                setRegion((prev) => prev ?? toRegionFromCoords(FALLBACK_COORDS))
+                setLocationBooting(false)
+                setOpenHomeGateOnLoad(true)
+                setLocationFallbackModalVisible(false)
+              }}
+            >
+              <Text style={[styles.locationFallbackBtnText, styles.locationFallbackBtnPrimaryText]}>Set home address</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.locationFallbackBtn, styles.locationFallbackBtnSecondary]}
+              onPress={() => {
+                setUserCoords(FALLBACK_COORDS)
+                setRegion((prev) => prev ?? toRegionFromCoords(FALLBACK_COORDS))
+                setLocationBooting(false)
+                setLocationFallbackModalVisible(false)
+              }}
+            >
+              <Text style={styles.locationFallbackBtnText}>Use London</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+    </>
   )
 }
 
 const styles = StyleSheet.create({
+  locationFallbackOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.72)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  locationFallbackCard: {
+    backgroundColor: SURFACE,
+    borderRadius: 16,
+    padding: 24,
+    width: '100%',
+    maxWidth: 360,
+    gap: 12,
+  },
+  locationFallbackTitle: {
+    color: '#fff',
+    fontSize: 17,
+    fontWeight: '700',
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  locationFallbackBtn: {
+    backgroundColor: ACCENT,
+    borderRadius: 10,
+    paddingVertical: 13,
+    alignItems: 'center',
+  },
+  locationFallbackBtnSecondary: {
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  locationFallbackBtnText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  locationFallbackBtnPrimaryText: {
+    color: '#0a0a0a',
+  },
   root: { flex: 1, backgroundColor: BG },
   toastHost: {
     ...StyleSheet.absoluteFillObject,
@@ -1340,13 +1574,16 @@ const styles = StyleSheet.create({
     pointerEvents: 'box-none',
   },
   mapShell: { flex: 1, position: 'relative' },
-  map: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
-  bottomFloatingChrome: {
+  map: { width: Dimensions.get('window').width, height: Dimensions.get('window').height, backgroundColor: 'transparent' },
+  bottomFilterSafeArea: {
     position: 'absolute',
     left: 0,
     right: 0,
+    bottom: 0,
     zIndex: 72,
-    elevation: 14,
+    elevation: 8,
+    backgroundColor: 'transparent',
+    pointerEvents: 'box-none',
   },
   bottomFloatingColumn: {
     flexDirection: 'column',
@@ -1358,19 +1595,22 @@ const styles = StyleSheet.create({
   },
   filterGradient: {
     width: '100%',
-    paddingTop: 24,
+    paddingTop: 20,
     paddingHorizontal: 12,
+    paddingBottom: 10,
   },
   poiLoadingStackBlock: {
     width: '100%',
   },
   poiLoadingTitle: {
-    color: MUTED,
+    color: '#fff',
     fontSize: 12,
     fontWeight: '600',
     marginBottom: 6,
     textAlign: 'center',
+    /* Same legibility as MAP_OVERLAY_TEXT_SHADOW; tighter radius keeps blur from sitting "inside" glyphs. */
     ...MAP_OVERLAY_TEXT_SHADOW,
+    textShadowRadius: 2,
   },
   poiLoadingCard: {
     flexDirection: 'row',
@@ -1417,7 +1657,7 @@ const styles = StyleSheet.create({
   filterRowCombined: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingBottom: 4,
+    paddingBottom: 6,
     gap: 6,
     overflow: 'hidden',
   },
@@ -1453,60 +1693,133 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     ...MAP_OVERLAY_TEXT_SHADOW,
   },
-  chips: { paddingHorizontal: 4, gap: 8, alignItems: 'center', flexDirection: 'row' },
+  chips: {
+    paddingHorizontal: 4,
+    paddingVertical: 4,
+    paddingBottom: 8,
+    gap: 8,
+    alignItems: 'center',
+    flexDirection: 'row',
+  },
   chip: { flexDirection: 'row', alignItems: 'center', gap: 6, borderColor: 'rgba(0,191,165,0.4)', borderWidth: 1, backgroundColor: SURFACE, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 8 },
   chipOn: { backgroundColor: ACCENT, borderColor: ACCENT },
   chipLabel: { color: ACCENT, fontSize: 11, fontWeight: '600' },
   chipLabelOn: { color: '#0a0a0a' },
-  nudgePin: { width: 28, height: 28, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: ACCENT, borderWidth: 1, borderColor: '#0a0a0a' },
-  homePin: { width: 24, height: 24, borderRadius: 12, backgroundColor: ACCENT, alignItems: 'center', justifyContent: 'center' },
-  clusterMarkerWrap: {
+  markerCaptureRoot: {
     alignItems: 'center',
     justifyContent: 'center',
-    overflow: 'visible',
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    minWidth: 80,
+    minHeight: 80,
   },
-  clusterPill: {
-    elevation: 0,
-    overflow: 'visible',
-    minHeight: 32,
-    minWidth: 56,
-    borderRadius: 999,
-    flexShrink: 0,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+  nudgePin: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
     alignItems: 'center',
     justifyContent: 'center',
-    flexDirection: 'row',
-    flexWrap: 'nowrap',
-    gap: 5,
     backgroundColor: ACCENT,
-    borderWidth: 1,
-    borderColor: '#fff',
-    alignSelf: 'center',
+    borderWidth: 2,
+    borderColor: POI_MAP_BLUE,
   },
-  clusterPillIconSlot: { flexDirection: 'row', alignItems: 'center', gap: 2 },
-  clusterPillTypeCount: {
-    color: '#fff',
-    fontSize: 11,
-    fontWeight: '800',
-    includeFontPadding: false,
-    ...MAP_OVERLAY_TEXT_SHADOW,
+  nudgeClusterMarkerRoot: {
+    width: 140,
+    height: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  clusterPillOverflow: {
-    color: '#fff',
+  nudgeClusterPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: ACCENT,
+    borderRadius: 999,
+    paddingVertical: 4,
+    paddingLeft: 5,
+    paddingRight: 9,
+    borderWidth: 2,
+    borderColor: POI_MAP_BLUE,
+    gap: 5,
+  },
+  nudgeClusterLogoSlot: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    overflow: 'hidden',
+    marginRight: 2,
+  },
+  nudgeClusterIcons: { flexDirection: 'row', alignItems: 'center', gap: 1 },
+  nudgeClusterIconSlot: { marginHorizontal: -1 },
+  nudgeClusterMoreTypes: {
+    fontSize: 9,
     fontWeight: '800',
-    fontSize: 12,
+    color: 'rgba(10,22,36,0.78)',
     marginLeft: 2,
-    includeFontPadding: false,
-    ...MAP_OVERLAY_TEXT_SHADOW,
   },
-  clusterPillCount: {
-    color: '#fff',
+  nudgeClusterCount: {
+    color: POI_MAP_BLUE,
+    fontSize: 15,
     fontWeight: '800',
-    fontSize: 13,
-    marginLeft: 4,
-    includeFontPadding: false,
-    ...MAP_OVERLAY_TEXT_SHADOW,
+    minWidth: 18,
+    textAlign: 'center',
+  },
+  poiClusterMarkerRoot: {
+    width: 120,
+    height: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  poiPin: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: POI_MAP_BLUE,
+    borderWidth: 2,
+    borderColor: ACCENT,
+  },
+  poiClusterPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: POI_MAP_BLUE,
+    borderRadius: 999,
+    paddingVertical: 5,
+    paddingLeft: 7,
+    paddingRight: 9,
+    borderWidth: 2,
+    borderColor: ACCENT,
+    gap: 6,
+  },
+  poiClusterIcons: { flexDirection: 'row', alignItems: 'center', gap: 1 },
+  poiClusterIconSlot: { marginHorizontal: -1 },
+  poiClusterMoreTypes: {
+    fontSize: 9,
+    fontWeight: '800',
+    color: 'rgba(0,191,165,0.85)',
+    marginLeft: 2,
+  },
+  poiClusterCount: {
+    color: ACCENT,
+    fontSize: 15,
+    fontWeight: '800',
+    minWidth: 18,
+    textAlign: 'center',
+  },
+  homePin: { width: 24, height: 24, borderRadius: 12, backgroundColor: ACCENT, alignItems: 'center', justifyContent: 'center' },
+  userLocationPin: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: ACCENT,
+    borderWidth: 2,
+    borderColor: '#fff',
+  },
+  searchAnchorPin: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: '#f59e0b',
   },
   mapTypeBtn: {
     position: 'absolute',
@@ -1613,6 +1926,19 @@ const styles = StyleSheet.create({
   },
   mapPickText: { color: '#fff', fontWeight: '700', ...MAP_OVERLAY_TEXT_SHADOW },
   mapPickCancel: { color: ACCENT, fontWeight: '700' },
+  addHomeBtn: {
+    alignSelf: 'flex-end',
+    marginRight: 12,
+    marginBottom: 6,
+    backgroundColor: ACCENT,
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  addHomeBtnText: { color: '#0a0a0a', fontWeight: '800', fontSize: 12 },
   leaveHomeQuick: {
     position: 'absolute',
     right: 12,
